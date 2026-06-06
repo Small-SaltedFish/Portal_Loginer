@@ -2,6 +2,10 @@
 
 OpenWrt 校园网 Portal 自动认证插件 — 纯 Shell 实现，LuCI 原生界面
 
+测试于**沈阳建筑大学(SJZU)**的中国移动登录门户。
+
+<img width="612" height="525" alt="image" src="https://github.com/user-attachments/assets/cfb6e855-da6a-4d42-aa8a-24d3eff77ee0" />
+
 适用于 DHCP 接入校园网光猫的路由器场景，自动完成 Portal 登录并持续保持在线。
 
 ## 特性
@@ -115,7 +119,7 @@ portal-login test-encrypt   # 测试 AES 加密
 | 监听端口 | 无（纯客户端） | 7890 等 |
 | 冲突 | 无 | 无 |
 
-> **注意**：如果代理工具开启了"路由器本身走代理"，portal-login 的 curl 可能被劫持导致超时。建议关闭路由器本身的代理，或在代理工具中将 portal 相关 IP 加入直连列表。
+> **注意**：如果代理工具开启了"路由器本身走代理"，portal-login 的 curl 可能被劫持导致超时。建议关闭路由器本身的代理，或在代理工具中将 portal 相关 IP 加入直连列表。若采用国内外分流（如Clash国内流量不进入内核），可以考虑使用http://connect.rom.miui.com/generate_204等国内验证连通性url。
 
 ## 卸载
 
@@ -125,7 +129,7 @@ opkg remove luci-app-portal-login
 
 ## 许可证
 
-MIT License
+Apache 2.0 License
 
 ## 致谢
 
