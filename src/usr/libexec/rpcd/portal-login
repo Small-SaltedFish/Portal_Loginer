@@ -1,0 +1,195 @@
+#!/bin/sh
+
+STATUS_FILE="/tmp/portal-login.status"
+LOG_FILE="/tmp/portal-login.log"
+PID_FILE="/var/run/portal-login.pid"
+PROG="/usr/bin/portal-login"
+
+js()    { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
+st_get(){ grep "^${1}=" "$STATUS_FILE" 2>/dev/null | cut -d= -f2-; }
+st_set(){
+    local k v; k="$1"; v="$2"
+    if grep -q "^${k}=" "$STATUS_FILE" 2>/dev/null; then
+        sed -i "s|^${k}=.*|${k}=${v}|" "$STATUS_FILE"
+    else
+        echo "${k}=${v}" >> "$STATUS_FILE"
+    fi
+}
+is_running(){
+    local pid; pid=$(cat "$PID_FILE" 2>/dev/null)
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+uptime_str(){
+    local ts; ts=$(st_get LOGIN_TS)
+    [ -z "$ts" ] || [ "$ts" = "0" ] && return
+    local now d; now=$(date +%s); d=$(( now - ts ))
+    printf "%02d:%02d:%02d" "$(( d/3600 ))" "$(( (d%3600)/60 ))" "$(( d%60 ))"
+}
+uci_get(){ uci -q get "portal_login.main.$1" 2>/dev/null; }
+
+list_methods(){
+    printf '{\n'
+    printf '  "get_status": {},\n'
+    printf '  "get_logs":   { "lines": 0 },\n'
+    printf '  "get_config": {},\n'
+    printf '  "set_config": {\n'
+    printf '    "user":"","pass":"","key":"","probe_url":"",\n'
+    printf '    "check_interval":0,"retry_interval":0,\n'
+    printf '    "relogin_hour":0,"log_max":0,"debug":0,"enabled":0\n'
+    printf '  },\n'
+    printf '  "do_action": { "action": "" }\n'
+    printf '}\n'
+}
+
+method_get_status(){
+    if is_running; then
+        local running; running="true"
+    else
+        local running; running="false"
+        st_set STATE "STOPPED" 2>/dev/null
+    fi
+    printf '{\n'
+    printf '  "state":      %s,\n' "$(js "$(st_get STATE)")"
+    printf '  "running":    %s,\n' "$running"
+    printf '  "p_host":     %s,\n' "$(js "$(st_get P_HOST)")"
+    printf '  "p_bras":     %s,\n' "$(js "$(st_get P_BRAS)")"
+    printf '  "p_clientip": %s,\n' "$(js "$(st_get P_CLIENTIP)")"
+    printf '  "p_vlan":     %s,\n' "$(js "$(st_get P_VLAN)")"
+    printf '  "last_login": %s,\n' "$(js "$(st_get LAST_LOGIN)")"
+    printf '  "last_check": %s,\n' "$(js "$(st_get LAST_CHECK)")"
+    printf '  "login_ts":   %s,\n' "$(st_get LOGIN_TS 2>/dev/null || echo 0)"
+    printf '  "uptime":     %s,\n' "$(js "$(uptime_str)")"
+    printf '  "fail_count": %s,\n' "$(st_get FAIL_COUNT 2>/dev/null || echo 0)"
+    printf '  "error":      %s\n'  "$(js "$(st_get ERROR)")"
+    printf '}\n'
+}
+
+method_get_logs(){
+    local input; input=$(cat /dev/stdin)
+    local n; n=$(echo "$input" | jsonfilter -e '@.lines' 2>/dev/null)
+    [ -z "$n" ] || [ "$n" -le 0 ] && n=100
+    [ "$n" -gt 5000 ] && n=5000
+    local raw; raw=""
+    if [ -f "$LOG_FILE" ]; then
+        raw=$(tail -n "$n" "$LOG_FILE" \
+            | sed 's/\\/\\\\/g; s/"/\\"/g' \
+            | awk '{printf "%s\\n",$0}')
+    fi
+    printf '{"lines":"%s"}\n' "$raw"
+}
+
+method_get_config(){
+    local has_pass; has_pass="false"
+    [ -n "$(uci_get pass)" ] && has_pass="true"
+    printf '{\n'
+    printf '  "user":           %s,\n' "$(js "$(uci_get user)")"
+    printf '  "has_pass":       %s,\n' "$has_pass"
+    printf '  "key":            %s,\n' "$(js "$(uci_get key)")"
+    printf '  "probe_url":      %s,\n' "$(js "$(uci_get probe_url)")"
+    printf '  "check_interval": %s,\n' "$(js "$(uci_get check_interval)")"
+    printf '  "retry_interval": %s,\n' "$(js "$(uci_get retry_interval)")"
+    printf '  "relogin_hour":   %s,\n' "$(js "$(uci_get relogin_hour)")"
+    printf '  "log_max":        %s,\n' "$(js "$(uci_get log_max)")"
+    printf '  "debug":          %s,\n' "$(js "$(uci_get debug)")"
+    printf '  "enabled":        %s\n'  "$(js "$(uci_get enabled)")"
+    printf '}\n'
+}
+
+method_set_config(){
+    # 从 stdin 读取 JSON，写入临时文件供 jsonfilter 多次读取
+    local jf; jf="/tmp/.pl_cfg_$$"
+    cat /dev/stdin > "$jf"
+
+    local v
+
+    # 每个字段单独调用 jsonfilter，避免嵌套函数在 busybox ash 中的兼容问题
+    uci -q set portal_login.main=portal-login 2>/dev/null
+
+    v=$(jsonfilter -i "$jf" -e '@.user' 2>/dev/null)
+    [ -n "$v" ] && uci -q set portal_login.main.user="$v"
+
+    # 密码明文存储，与其他配置项相同处理
+    v=$(jsonfilter -i "$jf" -e '@.pass' 2>/dev/null)
+    [ -n "$v" ] && uci -q set portal_login.main.pass="$v"
+
+    v=$(jsonfilter -i "$jf" -e '@.key' 2>/dev/null)
+    [ -n "$v" ] && [ "${#v}" -eq 16 ] && uci -q set portal_login.main.key="$v"
+
+    v=$(jsonfilter -i "$jf" -e '@.probe_url' 2>/dev/null)
+    [ -n "$v" ] && uci -q set portal_login.main.probe_url="$v"
+
+    v=$(jsonfilter -i "$jf" -e '@.check_interval' 2>/dev/null)
+    [ -n "$v" ] && uci -q set portal_login.main.check_interval="$v"
+
+    v=$(jsonfilter -i "$jf" -e '@.retry_interval' 2>/dev/null)
+    [ -n "$v" ] && uci -q set portal_login.main.retry_interval="$v"
+
+    v=$(jsonfilter -i "$jf" -e '@.relogin_hour' 2>/dev/null)
+    [ -n "$v" ] && uci -q set portal_login.main.relogin_hour="$v"
+
+    v=$(jsonfilter -i "$jf" -e '@.log_max' 2>/dev/null)
+    [ -n "$v" ] && [ "$v" -ge 50 ] 2>/dev/null && uci -q set portal_login.main.log_max="$v"
+
+    v=$(jsonfilter -i "$jf" -e '@.debug' 2>/dev/null)
+    [ -n "$v" ] && uci -q set portal_login.main.debug="$v"
+
+    v=$(jsonfilter -i "$jf" -e '@.enabled' 2>/dev/null)
+    [ -n "$v" ] && uci -q set portal_login.main.enabled="$v"
+
+    rm -f "$jf"
+    uci -q commit portal_login 2>/dev/null
+
+    printf '{"result":"ok","msg":"配置已保存"}\n'
+}
+
+method_do_action(){
+    local jf; jf="/tmp/.pl_act_$$"
+    cat /dev/stdin > "$jf"
+    local action; action=$(jsonfilter -i "$jf" -e '@.action' 2>/dev/null)
+    rm -f "$jf"
+
+    local msg; msg="ok"
+    local result; result="ok"
+    case "$action" in
+        start)
+            /etc/init.d/portal-login start >/dev/null 2>&1
+            msg="启动中" ;;
+        stop)
+            /etc/init.d/portal-login stop >/dev/null 2>&1
+            st_set STATE "STOPPED" 2>/dev/null
+            msg="已停止" ;;
+        restart)
+            /etc/init.d/portal-login restart >/dev/null 2>&1
+            msg="重启中" ;;
+        login)
+            $PROG login >/dev/null 2>&1 &
+            msg="登录中" ;;
+        relogin)
+            $PROG relogin >/dev/null 2>&1 &
+            msg="重新登录中" ;;
+        probe)
+            $PROG probe >/dev/null 2>&1 &
+            msg="探测中" ;;
+        logs_clear)
+            true > "$LOG_FILE"
+            msg="日志已清空" ;;
+        *)
+            msg="未知操作: $action"
+            result="error" ;;
+    esac
+    printf '{"result":"%s","msg":"%s"}\n' "$result" "$msg"
+}
+
+case "$1" in
+    list) list_methods ;;
+    call)
+        case "$2" in
+            get_status)  method_get_status  ;;
+            get_logs)    method_get_logs    ;;
+            get_config)  method_get_config  ;;
+            set_config)  method_set_config  ;;
+            do_action)   method_do_action   ;;
+            *) printf '{"error":"unknown method"}\n' ;;
+        esac ;;
+    *) printf '{"error":"usage error"}\n' ;;
+esac

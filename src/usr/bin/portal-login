@@ -1,0 +1,760 @@
+#!/bin/sh
+# portal-login v1.2  — OpenWrt 校园网 Portal 自动认证守护程序
+# 设备: Cudy TR3000 / KWrt
+#
+# 登录原理:
+#   向普通 HTTP 地址发请求 → 被 AC 拦截 → 302 到 portal 登录页
+#   Location URL 携带全部动态参数 (host/bras/clientip/mac/vlan)
+#   解析参数 → AES-128-ECB 加密密码 → POST login → POST ack_auth
+#
+# 示例 302 Location:
+#   http://192.168.199.200/index.html?bras=hn&wlanuserip=10.17.231.135
+#   &clientip=10.17.231.135&wlanacname=hn&clientmac=d8:bb:c1:9e:7b:1b
+#   &paip=172.16.100.200&vlan=1407.1051&iarmdst=140.143.144.103:8082/
+
+readonly VERSION="1.3"
+readonly PROG="portal-login"
+
+STATUS_FILE="/tmp/portal-login.status"
+LOG_FILE="/tmp/portal-login.log"
+PID_FILE="/var/run/portal-login.pid"
+LOCK_FILE="/var/lock/portal-login.lock"
+COOKIE_FILE="/tmp/portal-login.cookies"
+
+# UCI 配置默认值
+CFG_USER=""
+CFG_PASS=""
+CFG_KEY="5a3b9f207411a8ed"
+CFG_PROBE_URL="http://connecttest.com/"
+CFG_CHECK_INTERVAL=30
+CFG_RETRY_INTERVAL=10
+CFG_RELOGIN_HOUR=4        # 每天几点强制重新登录 (0-23，-1 禁用)
+CFG_LOG_MAX=500
+CFG_ENABLED=1
+CFG_DEBUG=0
+
+# 运行时 portal 参数（每次 probe 后更新）
+P_HOST=""
+P_BRAS=""
+P_CLIENTIP=""
+P_WLANUSERIP=""
+P_WLANACNAME=""
+P_CLIENTMAC=""
+P_PAIP=""
+P_VLAN=""
+P_PORTAL_URL=""
+
+_state="IDLE"
+_login_ts=0
+_fail_count=0
+_last_relogin_day=0
+_online_count=0          # 连续在线次数（用于日志汇总）
+
+# =============================================================================
+# 日志
+# =============================================================================
+_ts()    { date '+%Y-%m-%d %H:%M:%S'; }
+_day()   { date '+%j'; }
+_hour()  { date '+%H' | sed 's/^0//'; }
+
+_log() {
+    local lvl="$1"; shift
+    local line="[$lvl] $(_ts) $*"
+    echo "$line" >> "$LOG_FILE"
+    echo "$line" >&2   # 输出到 stderr，避免污染 $() 命令替换的 stdout 捕获
+    local n; n=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
+    if [ "$n" -gt "$CFG_LOG_MAX" ]; then
+        local t; t=$(tail -n "$CFG_LOG_MAX" "$LOG_FILE"); echo "$t" > "$LOG_FILE"
+    fi
+}
+log_i() { _log "INFO " "$@"; }
+log_w() { _log "WARN " "$@"; }
+log_e() { _log "ERROR" "$@"; }
+log_d() { [ "$CFG_DEBUG" = "1" ] && _log "DEBUG" "$@"; return 0; }
+
+# =============================================================================
+# 状态文件（供 LuCI rpcd 读取）
+# =============================================================================
+st_set() {
+    local k="$1" v="$2"
+    if grep -q "^${k}=" "$STATUS_FILE" 2>/dev/null; then
+        sed -i "s|^${k}=.*|${k}=${v}|" "$STATUS_FILE"
+    else
+        echo "${k}=${v}" >> "$STATUS_FILE"
+    fi
+}
+st_get() { grep "^${1}=" "$STATUS_FILE" 2>/dev/null | cut -d= -f2-; }
+
+_set_state() {
+    _state="$1"; st_set STATE "$_state"; st_set LAST_CHECK "$(_ts)"
+}
+
+_init_status() {
+    cat > "$STATUS_FILE" <<EOF
+STATE=IDLE
+LAST_LOGIN=
+LAST_CHECK=
+LOGIN_TS=0
+FAIL_COUNT=0
+P_HOST=
+P_BRAS=
+P_CLIENTIP=
+P_VLAN=
+ERROR=
+PID=$$
+VERSION=$VERSION
+EOF
+}
+
+# =============================================================================
+# UCI 配置
+# =============================================================================
+load_cfg() {
+    command -v uci >/dev/null 2>&1 || { echo "load_cfg: uci 不可用" >&2; return; }
+    local v
+    v=$(uci -q get portal_login.main.enabled 2>/dev/null);        [ -n "$v" ] && CFG_ENABLED="$v"
+    v=$(uci -q get portal_login.main.user 2>/dev/null);           [ -n "$v" ] && CFG_USER="$v"
+    v=$(uci -q get portal_login.main.pass 2>/dev/null);           [ -n "$v" ] && CFG_PASS="$v"
+    v=$(uci -q get portal_login.main.key 2>/dev/null);            [ -n "$v" ] && CFG_KEY="$v"
+    v=$(uci -q get portal_login.main.probe_url 2>/dev/null);      [ -n "$v" ] && CFG_PROBE_URL="$v"
+    v=$(uci -q get portal_login.main.check_interval 2>/dev/null); [ -n "$v" ] && CFG_CHECK_INTERVAL="$v"
+    v=$(uci -q get portal_login.main.retry_interval 2>/dev/null); [ -n "$v" ] && CFG_RETRY_INTERVAL="$v"
+    v=$(uci -q get portal_login.main.relogin_hour 2>/dev/null);   [ -n "$v" ] && CFG_RELOGIN_HOUR="$v"
+    v=$(uci -q get portal_login.main.log_max 2>/dev/null);        [ -n "$v" ] && [ "$v" -ge 50 ] 2>/dev/null && CFG_LOG_MAX="$v"
+    v=$(uci -q get portal_login.main.debug 2>/dev/null);          [ -n "$v" ] && CFG_DEBUG="$v"
+    # 配置加载诊断（始终输出到 stderr，不受 debug 开关控制）
+    [ -z "$CFG_USER" ] && echo "load_cfg: 警告 - user 为空，检查 uci get portal_login.main.user" >&2
+}
+
+# =============================================================================
+# Portal 参数持久化（UCI）— 解决重启后 fallback 参数丢失
+# =============================================================================
+_save_params_uci() {
+    # 将当前 portal 参数持久化到 UCI，重启后仍可用于 fallback
+    command -v uci >/dev/null 2>&1 || return
+    [ -z "$P_HOST" ] && return
+    uci -q set portal_login.main.last_host="$P_HOST"       2>/dev/null
+    uci -q set portal_login.main.last_bras="$P_BRAS"       2>/dev/null
+    uci -q set portal_login.main.last_clientip="$P_CLIENTIP" 2>/dev/null
+    uci -q set portal_login.main.last_clientmac="$P_CLIENTMAC" 2>/dev/null
+    uci -q set portal_login.main.last_paip="$P_PAIP"       2>/dev/null
+    uci -q set portal_login.main.last_vlan="$P_VLAN"       2>/dev/null
+    uci -q commit portal_login 2>/dev/null
+    log_d "portal 参数已持久化到 UCI"
+}
+
+_restore_params_uci() {
+    # daemon 启动时从 UCI 恢复上次保存的 portal 参数到 status 文件
+    command -v uci >/dev/null 2>&1 || return
+    local v
+    v=$(uci -q get portal_login.main.last_host 2>/dev/null)
+    [ -z "$v" ] && return 1
+    st_set P_HOST "$v";      P_HOST="$v"
+    v=$(uci -q get portal_login.main.last_bras 2>/dev/null)
+    [ -n "$v" ] && { st_set P_BRAS "$v";      P_BRAS="$v"; }
+    v=$(uci -q get portal_login.main.last_clientip 2>/dev/null)
+    [ -n "$v" ] && { st_set P_CLIENTIP "$v";   P_CLIENTIP="$v"; }
+    v=$(uci -q get portal_login.main.last_clientmac 2>/dev/null)
+    [ -n "$v" ] && { st_set P_CLIENTMAC "$v";  P_CLIENTMAC="$v"; }
+    v=$(uci -q get portal_login.main.last_paip 2>/dev/null)
+    [ -n "$v" ] && { st_set P_PAIP "$v";       P_PAIP="$v"; }
+    v=$(uci -q get portal_login.main.last_vlan 2>/dev/null)
+    [ -n "$v" ] && { st_set P_VLAN "$v";       P_VLAN="$v"; }
+    log_i "恢复缓存参数: host=$P_HOST bras=$P_BRAS ip=$P_CLIENTIP"
+    return 0
+}
+
+# =============================================================================
+# WAN 接口检测
+# =============================================================================
+# 获取 WAN IP（stdout 输出 IP，无 IP 则输出空）
+_get_wan_ip() {
+    local wan_dev wan_ip
+    if command -v uci >/dev/null 2>&1; then
+        wan_dev=$(uci -q get network.wan.device 2>/dev/null)
+        [ -z "$wan_dev" ] && wan_dev=$(uci -q get network.wan.ifname 2>/dev/null)
+    fi
+    # 按优先级尝试多种接口名
+    for dev in "$wan_dev" eth1 br-wan wan pppoe-wan; do
+        [ -z "$dev" ] && continue
+        wan_ip=$(ip -4 addr show dev "$dev" 2>/dev/null \
+            | grep -oE 'inet [0-9.]+' | head -1 | cut -d' ' -f2)
+        [ -n "$wan_ip" ] && { echo "$wan_ip"; return 0; }
+    done
+    return 1
+}
+
+# 从 WAN 接口刷新 P_CLIENTIP / P_CLIENTMAC（DHCP 续租后 IP 可能变）
+_refresh_wan_params() {
+    local wan_dev wan_ip wan_mac
+    if command -v uci >/dev/null 2>&1; then
+        wan_dev=$(uci -q get network.wan.device 2>/dev/null)
+        [ -z "$wan_dev" ] && wan_dev=$(uci -q get network.wan.ifname 2>/dev/null)
+    fi
+    for dev in "$wan_dev" eth1 br-wan wan pppoe-wan; do
+        [ -z "$dev" ] && continue
+        wan_ip=$(ip -4 addr show dev "$dev" 2>/dev/null \
+            | grep -oE 'inet [0-9.]+' | head -1 | cut -d' ' -f2)
+        if [ -n "$wan_ip" ]; then
+            wan_dev="$dev"
+            break
+        fi
+    done
+    wan_mac=$(cat "/sys/class/net/$wan_dev/address" 2>/dev/null)
+    if [ -n "$wan_ip" ]; then
+        log_d "WAN 接口: dev=$wan_dev ip=$wan_ip mac=$wan_mac"
+        P_CLIENTIP="$wan_ip"
+        P_WLANUSERIP="$wan_ip"
+        st_set P_CLIENTIP "$wan_ip"
+        [ -n "$wan_mac" ] && { P_CLIENTMAC="$wan_mac"; st_set P_CLIENTMAC "$wan_mac"; }
+    fi
+}
+
+# 从 status 文件恢复 portal 参数 + WAN 接口实时刷新
+_restore_saved_params() {
+    P_HOST=$(st_get P_HOST)
+    P_BRAS=$(st_get P_BRAS)
+    P_CLIENTIP=$(st_get P_CLIENTIP)
+    P_WLANUSERIP=$(st_get P_CLIENTIP)
+    P_CLIENTMAC=$(st_get P_CLIENTMAC)
+    P_PAIP=$(st_get P_PAIP)
+    P_VLAN=$(st_get P_VLAN)
+    _refresh_wan_params  # 用 WAN 接口实时 IP/MAC 覆盖
+}
+
+# =============================================================================
+# 核心：probe 探测
+#   返回 0 = 需要登录（P_* 已填充）
+#   返回 1 = 已在线
+#   返回 2 = WAN 未连接或无法探测
+# =============================================================================
+probe_portal() {
+    local result http_code redirect_url
+
+    result=$(curl -s --noproxy '*' \
+        --connect-timeout 6 --max-time 10 \
+        --max-redirs 0 \
+        -o /dev/null \
+        -w "%{http_code} %{redirect_url}" \
+        "$CFG_PROBE_URL" 2>/dev/null)
+
+    http_code=$(echo "$result" | cut -d' ' -f1)
+    redirect_url=$(echo "$result" | cut -d' ' -f2-)
+    log_d "探测 $CFG_PROBE_URL → $http_code"
+
+    case "$http_code" in
+        200|204)
+            return 1
+            ;;
+        301|302|303|307|308)
+            [ -z "$redirect_url" ] && { log_w "探测 → ${http_code} 但 Location 为空"; return 2; }
+            case "$redirect_url" in
+                *bras=*|*wlanuserip=*|*clientmac=*|*wlanacname=*)
+                    log_i "探测 → 302 发现 portal"
+                    _parse_portal_url "$redirect_url" && return 0
+                    return 2
+                    ;;
+                *)
+                    log_d "探测 → ${http_code} 非 portal 重定向"
+                    return 1
+                    ;;
+            esac
+            ;;
+        ""|000)
+            local wan_ip
+            wan_ip=$(_get_wan_ip)
+            if [ -z "$wan_ip" ]; then
+                return 2
+            fi
+
+            # WAN 有 IP 但超时 → 备用 IP 重试（绕过 DNS）
+            log_d "探测超时, WAN=$wan_ip, 备用 IP 重试"
+            local alt_ip alt_r alt_code alt_redir
+            for alt_ip in "1.1.1.1" "204.2.134.100"; do
+                alt_r=$(curl -s --noproxy '*' \
+                    --connect-timeout 6 --max-time 10 \
+                    --max-redirs 0 \
+                    -o /dev/null \
+                    -w "%{http_code} %{redirect_url}" \
+                    "http://${alt_ip}/" 2>/dev/null)
+                alt_code=$(echo "$alt_r" | cut -d' ' -f1)
+                alt_redir=$(echo "$alt_r" | cut -d' ' -f2-)
+                log_d "备用探测 $alt_ip → $alt_code"
+                case "$alt_code" in
+                    200|204)
+                        return 1 ;;
+                    301|302|303|307|308)
+                        case "$alt_redir" in
+                            *bras=*|*wlanuserip=*|*clientmac=*|*wlanacname=*)
+                                log_i "探测 → $alt_ip 获取到 portal 302"
+                                _parse_portal_url "$alt_redir" && return 0
+                                ;;
+                        esac
+                        return 1 ;;
+                esac
+                break
+            done
+
+            # 全部超时 → 直连 portal 内网 fallback
+            local saved_host; saved_host=$(st_get P_HOST)
+            if [ -n "$saved_host" ]; then
+                local code3
+                code3=$(curl -s --noproxy '*' \
+                    --connect-timeout 4 --max-time 6 \
+                    -o /dev/null \
+                    -w "%{http_code}" \
+                    "${saved_host}/index.html" 2>/dev/null)
+                log_d "直连 portal $saved_host → $code3"
+                if [ -n "$code3" ] && [ "$code3" != "000" ]; then
+                    log_i "探测 → 超时, WAN=$wan_ip, portal 可达, session 过期"
+                else
+                    log_w "探测 → 超时, WAN=$wan_ip, portal 不可达, 仍尝试登录"
+                fi
+                _restore_saved_params
+                return 0
+            fi
+
+            log_w "探测 → 超时, WAN=$wan_ip, 无缓存参数 (需手动 portal-login login)"
+            return 2
+            ;;
+        *)
+            log_d "探测 → HTTP $http_code, 视为在线"
+            return 1
+            ;;
+    esac
+}
+
+_parse_portal_url() {
+    local url="$1"
+    P_PORTAL_URL="$url"
+    P_HOST=$(echo "$url" | sed 's|\(https\?://[^/?]*\).*|\1|')
+    _ep() { printf '%s' "$url" | grep -oE "[?&]${1}=[^&]+" | head -1 | cut -d= -f2; }
+    P_BRAS=$(_ep bras)
+    P_CLIENTIP=$(_ep clientip)
+    P_WLANUSERIP=$(_ep wlanuserip)
+    P_WLANACNAME=$(_ep wlanacname)
+    P_CLIENTMAC=$(_ep clientmac)
+    P_PAIP=$(_ep paip)
+    P_VLAN=$(_ep vlan)
+    [ -z "$P_BRAS" ] && [ -n "$P_WLANACNAME" ] && P_BRAS="$P_WLANACNAME"
+    [ -z "$P_HOST" ] || [ -z "$P_BRAS" ] && {
+        log_e "Portal URL 解析失败: $url"; return 1
+    }
+    log_i "Portal: host=$P_HOST bras=$P_BRAS ip=$P_CLIENTIP mac=$P_CLIENTMAC vlan=$P_VLAN"
+    st_set P_HOST      "$P_HOST"
+    st_set P_BRAS      "$P_BRAS"
+    st_set P_CLIENTIP  "$P_CLIENTIP"
+    st_set P_CLIENTMAC "$P_CLIENTMAC"
+    st_set P_PAIP      "$P_PAIP"
+    st_set P_VLAN      "$P_VLAN"
+    _save_params_uci   # 持久化到 UCI，重启后可用于 fallback
+    return 0
+}
+
+# =============================================================================
+# 密钥自动检测
+# =============================================================================
+detect_key() {
+    [ -z "$P_HOST" ] && return 1
+    local content candidate path
+    for path in "/assets/js/raas.js" "/js/raas.js" "/tp/default/js/index.js"; do
+        content=$(curl -s --noproxy '*' --connect-timeout 5 --max-time 8 "${P_HOST}${path}" 2>/dev/null)
+        [ -z "$content" ] && continue
+        candidate=$(printf '%s' "$content" | grep -oE '"[A-Za-z0-9]{16}"' | head -1 | tr -d '"')
+        [ -z "$candidate" ] && continue
+        if [ "$candidate" != "$CFG_KEY" ]; then
+            log_i "密钥变更: ${CFG_KEY:0:4}**** → ${candidate:0:4}****"
+            CFG_KEY="$candidate"
+            uci -q set portal_login.main.key="$candidate" 2>/dev/null
+            uci -q commit portal_login 2>/dev/null
+        fi
+        return 0
+    done
+    return 1
+}
+
+# =============================================================================
+# AES-128-ECB 密码加密（与 portal JS 完全一致）
+# =============================================================================
+encrypt_pass() {
+    local plain="$1" key="$2"
+    # 32 位纯字母数字直接返回（已加密 token）
+    [ ${#plain} -eq 32 ] && case "$plain" in
+        *[!A-Za-z0-9]*) ;;
+        *) echo "$plain"; return 0 ;;
+    esac
+
+    local prefix
+    prefix=$(cat /dev/urandom 2>/dev/null \
+        | tr -dc 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/' \
+        | head -c 4 2>/dev/null)
+    [ ${#prefix} -ne 4 ] && prefix="xK9z"
+
+    local pt="${prefix}${plain}"
+    local pad=$(( (16 - (${#pt} % 16)) % 16 ))
+    # key → hex（hexdump 或 od 均可）
+    local keyhex
+    if command -v hexdump >/dev/null 2>&1; then
+        keyhex=$(printf '%s' "$key" | hexdump -v -e '/1 "%02x"')
+    else
+        keyhex=$(printf '%s' "$key" | od -A n -t x1 | tr -d ' \n')
+    fi
+    [ -z "$keyhex" ] && { log_e "encrypt: key 转 hex 失败"; return 1; }
+
+    local tmp="/tmp/.pl_$$"
+    printf '%s' "$pt" > "$tmp"
+    local i=0; while [ $i -lt $pad ]; do printf '\000' >> "$tmp"; i=$(( i+1 )); done
+
+    # OpenSSL 3.x 兼容
+    local ct errmsg
+    errmsg=$(openssl enc -aes-128-ecb -nosalt -nopad \
+             -K "$keyhex" -in "$tmp" -out "$tmp.ct" 2>&1); local rc=$?
+    if [ $rc -ne 0 ]; then
+        # 尝试 legacy provider (某些 OpenSSL 3.x 配置)
+        errmsg=$(openssl enc -aes-128-ecb -nosalt -nopad \
+                 -provider default -K "$keyhex" -in "$tmp" -out "$tmp.ct" 2>&1); rc=$?
+    fi
+    if [ $rc -ne 0 ] || [ ! -s "$tmp.ct" ]; then
+        rm -f "$tmp" "$tmp.ct"
+        log_e "encrypt: openssl 失败: $errmsg"
+        return 1
+    fi
+
+    # 密文 → hex
+    local cthex
+    if command -v hexdump >/dev/null 2>&1; then
+        cthex=$(hexdump -v -e '/1 "%02x"' "$tmp.ct")
+    else
+        cthex=$(od -A n -t x1 "$tmp.ct" | tr -d ' \n')
+    fi
+    rm -f "$tmp" "$tmp.ct"
+    [ -z "$cthex" ] && { log_e "encrypt: 密文转 hex 失败"; return 1; }
+    echo "$cthex"
+}
+
+# =============================================================================
+# 登出（portal logoff API）
+# =============================================================================
+do_logout() {
+    # 从状态文件补充 portal 参数（probe 在线时内存变量未填充）
+    [ -z "$P_HOST" ]       && P_HOST=$(st_get P_HOST)
+    [ -z "$P_BRAS" ]       && P_BRAS=$(st_get P_BRAS)
+    [ -z "$P_CLIENTIP" ]   && P_CLIENTIP=$(st_get P_CLIENTIP)
+    [ -z "$P_CLIENTMAC" ]  && P_CLIENTMAC=$(st_get P_CLIENTMAC)
+    [ -z "$P_VLAN" ]       && P_VLAN=$(st_get P_VLAN)
+    if [ -z "$P_HOST" ]; then
+        log_d "登出: 无 portal host，跳过"
+        rm -f "$COOKIE_FILE"; return 0
+    fi
+    # logoff API：仅 URL 参数，无需 POST body，MAC 用连字符格式
+    local mac_dash
+    mac_dash=$(printf '%s' "$P_CLIENTMAC" | tr ':' '-')
+    local logoff_url
+    logoff_url="${P_HOST}/api/logoff.php?bras=${P_BRAS}&clientip=${P_CLIENTIP}"
+    [ -n "$mac_dash" ] && logoff_url="${logoff_url}&clientmac=${mac_dash}"
+    [ -n "$P_VLAN" ]   && logoff_url="${logoff_url}&vlan=${P_VLAN}"
+    log_d "登出: $logoff_url"
+    local resp
+    resp=$(curl -s --noproxy '*' --connect-timeout 8 --max-time 15         -X POST "$logoff_url" 2>/dev/null)
+    log_d "登出响应: $resp"
+    local ret msg
+    ret=$(printf '%s' "$resp" | grep -o '"ret":[^,}]*' | cut -d: -f2 | tr -d ' "')
+    msg=$(printf '%s' "$resp" | grep -o '"msg":"[^"]*"' | cut -d'"' -f4)
+    if [ "$ret" = "0" ]; then
+        log_i "登出成功"
+    else
+        log_w "登出异常: ret=$ret $msg"
+    fi
+    rm -f "$COOKIE_FILE"
+    return 0
+}
+
+# =============================================================================
+# 登录
+# =============================================================================
+_api_url() {
+    local qs="bras=${P_BRAS}"
+    [ -n "$P_CLIENTIP"   ] && qs="${qs}&clientip=${P_CLIENTIP}"
+    [ -n "$P_WLANUSERIP" ] && qs="${qs}&wlanuserip=${P_WLANUSERIP}"
+    [ -n "$P_WLANACNAME" ] && qs="${qs}&wlanacname=${P_WLANACNAME}"
+    [ -n "$P_CLIENTMAC"  ] && qs="${qs}&clientmac=${P_CLIENTMAC}"
+    [ -n "$P_PAIP"       ] && qs="${qs}&paip=${P_PAIP}"
+    [ -n "$P_VLAN"       ] && qs="${qs}&vlan=${P_VLAN}"
+    echo "${P_HOST}${1}?${qs}"
+}
+
+_curl_api() {
+    # 确保 cookie 文件存在，否则 -b 在某些 curl 版本下会报错
+    [ -f "$COOKIE_FILE" ] || touch "$COOKIE_FILE" 2>/dev/null
+    curl -s --noproxy '*' --connect-timeout 8 --max-time 15 \
+        -b "$COOKIE_FILE" -c "$COOKIE_FILE" \
+        -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64)" \
+        -H "Referer: ${P_HOST}/index.html?bras=${P_BRAS}" \
+        "$@"
+}
+
+do_login() {
+    [ -z "$CFG_USER" ] || [ -z "$CFG_PASS" ] && {
+        log_e "登录失败: 账号或密码未配置"; st_set ERROR "账号密码未配置"; return 1; }
+    [ -z "$P_HOST" ] && { log_e "登录失败: portal host 未知"; return 1; }
+
+    log_i "登录中: $CFG_USER → $P_HOST"
+    _set_state "LOGGING_IN"
+
+    local enc
+    enc=$(encrypt_pass "$CFG_PASS" "$CFG_KEY") || { _set_state "FAILED"; return 1; }
+    log_d "加密密码: ${enc:0:8}****"
+
+    # 建立 session cookie
+    _curl_api -o /dev/null \
+        "${P_HOST}/index.html?bras=${P_BRAS}&clientip=${P_CLIENTIP}&wlanuserip=${P_WLANUSERIP}&clientmac=${P_CLIENTMAC}" \
+        2>/dev/null
+
+    local resp
+    resp=$(_curl_api -X POST \
+        -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" \
+        -H "Accept: application/json, */*" \
+        --data-urlencode "user=${CFG_USER}" \
+        --data-urlencode "pass=${enc}" \
+        -d "authmode=0&pool=0&isp_id=0&pyacct=0" \
+        "$(_api_url /api/login.php)" 2>/dev/null)
+    log_d "login resp: $(printf '%s' "$resp" | head -c 300)"
+
+    local ret
+    ret=$(printf '%s' "$resp" | grep -o '"ret":[^,}]*' | cut -d: -f2 | tr -d ' "')
+    log_d "ret=$ret"
+    case "$ret" in
+        0|121|122|3)
+            ;;
+        '')
+            local msg; msg=$(printf '%s' "$resp" | grep -o '"msg":"[^"]*"' | cut -d'"' -f4)
+            log_e "登录失败: 服务器返回异常 msg=$msg"
+            st_set ERROR "ret=空 $msg"; return 1 ;;
+        *)
+            local msg; msg=$(printf '%s' "$resp" | grep -o '"msg":"[^"]*"' | cut -d'"' -f4)
+            log_e "登录失败: ret=$ret $msg"
+            st_set ERROR "ret=$ret $msg"; return 1 ;;
+    esac
+
+    # ack_auth
+    _curl_api -X POST \
+        -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" \
+        --data-urlencode "user=${CFG_USER}" \
+        --data-urlencode "pass=${enc}" \
+        -d "authmode=0&pool=0&isp_id=0&pyacct=0" \
+        "$(_api_url /api/ack_auth.php)" >/dev/null 2>&1
+
+    _login_ts=$(date +%s)
+    _fail_count=0
+    _last_relogin_day=$(_day)
+    st_set LAST_LOGIN "$(_ts)"; st_set LOGIN_TS "$_login_ts"
+    st_set FAIL_COUNT "0"; st_set ERROR ""
+    _set_state "LOGGED_IN"
+    log_i "登录成功"
+    return 0
+}
+
+# =============================================================================
+# 主循环
+# =============================================================================
+_sleep() { local s="$1" i=0; while [ $i -lt $s ]; do sleep 1; i=$(( i+1 )); done; }
+
+run_daemon() {
+    log_i "启动 v$VERSION (PID $$) user=$CFG_USER check=${CFG_CHECK_INTERVAL}s relogin=${CFG_RELOGIN_HOUR}:00"
+    echo "$$" > "$PID_FILE"
+    _init_status; _set_state "IDLE"
+
+    # 从 UCI 恢复上次保存的 portal 参数（重启后 /tmp 已清空）
+    _restore_params_uci
+
+    while true; do
+        st_set LAST_CHECK "$(_ts)"
+
+        # 每日定时强制重新登录
+        if [ "$CFG_RELOGIN_HOUR" -ge 0 ] 2>/dev/null; then
+            local cur_hour cur_day
+            cur_hour=$(_hour); cur_day=$(_day)
+            if [ "$cur_hour" = "$CFG_RELOGIN_HOUR" ] && [ "$cur_day" != "$_last_relogin_day" ]; then
+                log_i "定时重登录 (${CFG_RELOGIN_HOUR}:00)"
+                do_logout
+                _set_state "IDLE"
+                _last_relogin_day="$cur_day"
+            fi
+        fi
+
+        probe_portal
+        local pr=$?
+
+        if [ $pr -eq 0 ]; then
+            # 需要登录
+            _online_count=0
+            detect_key
+            if do_login; then
+                _sleep "$CFG_CHECK_INTERVAL"
+            else
+                _fail_count=$(( _fail_count + 1 ))
+                st_set FAIL_COUNT "$_fail_count"
+                _set_state "FAILED"
+                log_w "登录失败 (${_fail_count}次), ${CFG_RETRY_INTERVAL}s 后重试"
+                _sleep "$CFG_RETRY_INTERVAL"
+            fi
+        elif [ $pr -eq 1 ]; then
+            # 在线
+            _online_count=$(( _online_count + 1 ))
+            if [ "$_state" != "LOGGED_IN" ]; then
+                log_i "探测 → 在线"
+                _set_state "LOGGED_IN"
+                _online_count=1
+                if [ -z "$(st_get P_HOST)" ]; then
+                    log_d "无 portal 参数缓存，从 WAN 接口补充"
+                    _refresh_wan_params
+                fi
+            elif [ $(( _online_count % 10 )) -eq 0 ]; then
+                # 每 10 次探测汇总一行（约 5 分钟）
+                local mins=$(( _online_count * CFG_CHECK_INTERVAL / 60 ))
+                log_i "在线 ×${_online_count} (${mins}m)"
+            else
+                log_d "在线 ×${_online_count}"
+            fi
+            _sleep "$CFG_CHECK_INTERVAL"
+        else
+            # WAN 未连接或无法探测
+            _online_count=0
+            if [ "$_state" != "OFFLINE" ]; then
+                log_w "探测 → WAN 无 IP，等待网络"
+                _set_state "OFFLINE"
+            else
+                log_d "仍然离线，${CFG_RETRY_INTERVAL}s 后重试"
+            fi
+            _sleep "$CFG_RETRY_INTERVAL"
+        fi
+    done
+}
+
+# =============================================================================
+# CLI 接口
+# =============================================================================
+usage() {
+    cat <<EOF
+$PROG v$VERSION
+
+命令:
+  daemon          守护进程模式
+  start           前台运行（调试）
+  login           单次登录
+  relogin         强制重新登录（用于每日定时）
+  probe           探测 portal 参数
+  status          显示状态
+  logs [N]        显示最近 N 条日志
+  logs-clear      清空日志
+  test-encrypt    测试加密
+  stop            停止守护进程
+
+选项: --user --pass --key --probe --debug
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"; shift 2>/dev/null || true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --user)  CFG_USER="$2";      shift 2 ;;
+            --pass)  CFG_PASS="$2";      shift 2 ;;
+            --key)   CFG_KEY="$2";       shift 2 ;;
+            --probe) CFG_PROBE_URL="$2"; shift 2 ;;
+            --debug) CFG_DEBUG=1;        shift ;;
+            *)       shift ;;
+        esac
+    done
+
+    case "$cmd" in
+        daemon)
+            # procd 负责后台化、排他和 respawn
+            load_cfg
+            [ "$CFG_ENABLED" = "0" ] && exit 0
+            trap 'rm -f $LOCK_FILE; st_set STATE STOPPED; exit 0' INT TERM
+            run_daemon
+            ;;
+        start)
+            # 手动前台调试模式
+            load_cfg
+            [ "$CFG_ENABLED" = "0" ] && { echo "插件已禁用"; exit 0; }
+            trap 'rm -f $PID_FILE $LOCK_FILE; st_set STATE STOPPED; exit 0' INT TERM
+            run_daemon
+            ;;
+        login)
+            load_cfg
+            probe_portal && do_login
+            ;;
+        relogin)
+            load_cfg
+            log_i "强制重登录"
+            probe_portal
+            local r=$?
+            if [ $r -eq 2 ]; then
+                log_w "重登录失败: WAN 未连接"
+            else
+                do_logout
+                sleep 2
+                probe_portal; r=$?
+                if [ $r -eq 0 ]; then
+                    do_login
+                elif [ $r -eq 1 ]; then
+                    log_i "登出后 AC 未立即断网，用缓存参数重认证"
+                    P_HOST=$(st_get P_HOST)
+                    P_BRAS=$(st_get P_BRAS)
+                    P_CLIENTIP=$(st_get P_CLIENTIP)
+                    P_WLANUSERIP=$(st_get P_CLIENTIP)
+                    P_CLIENTMAC=$(st_get P_CLIENTMAC)
+                    P_PAIP=$(st_get P_PAIP)
+                    P_VLAN=$(st_get P_VLAN)
+                    if [ -n "$P_HOST" ] && [ -n "$P_BRAS" ]; then
+                        do_login
+                    else
+                        log_w "重登录失败: 无缓存 portal 参数"
+                    fi
+                else
+                    log_w "重登录失败: 登出后网络不通"
+                fi
+            fi
+            ;;
+        probe)
+            load_cfg
+            probe_portal; local r=$?
+            case $r in
+                0) echo "需要登录"; echo "Host: $P_HOST"; echo "bras: $P_BRAS"
+                   echo "clientip: $P_CLIENTIP"; echo "mac: $P_CLIENTMAC"
+                   echo "vlan: $P_VLAN"; echo "URL: $P_PORTAL_URL" ;;
+                1) echo "已在线" ;;
+                2) echo "WAN 未连接或无法探测" ;;
+            esac
+            ;;
+        status)
+            [ -f "$STATUS_FILE" ] || { echo "未运行"; exit 1; }
+            cat "$STATUS_FILE"
+            [ -f "$PID_FILE" ] && {
+                local pid; pid=$(cat "$PID_FILE")
+                kill -0 "$pid" 2>/dev/null \
+                    && echo "Daemon: 运行中 PID=$pid" \
+                    || echo "Daemon: 未运行（残留 PID 文件）"
+            }
+            ;;
+        logs)
+            [ -f "$LOG_FILE" ] && tail -n "${1:-50}" "$LOG_FILE" || echo "(无日志)"
+            ;;
+        logs-clear) > "$LOG_FILE"; echo "已清空" ;;
+        test-encrypt)
+            load_cfg
+            local r; r=$(encrypt_pass "${CFG_PASS:-testpass}" "$CFG_KEY")
+            [ -n "$r" ] && echo "OK: ${r:0:16}... ($(( ${#r}/2 )) bytes)" || { echo "FAIL"; exit 1; }
+            ;;
+        stop)
+            [ -f "$PID_FILE" ] && kill "$(cat "$PID_FILE")" 2>/dev/null
+            rm -f "$PID_FILE" "$LOCK_FILE"; echo "已停止"
+            ;;
+        help|--help|-h) usage ;;
+        *) echo "未知命令: $cmd"; usage; exit 1 ;;
+    esac
+}
+
+main "$@"

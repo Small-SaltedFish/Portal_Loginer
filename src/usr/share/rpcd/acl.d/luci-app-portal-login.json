@@ -1,0 +1,22 @@
+{
+    "luci-app-portal-login": {
+        "description": "Portal 自动登录插件权限",
+        "read": {
+            "ubus": {
+                "portal-login": [
+                    "get_status",
+                    "get_logs",
+                    "get_config"
+                ]
+            }
+        },
+        "write": {
+            "ubus": {
+                "portal-login": [
+                    "set_config",
+                    "do_action"
+                ]
+            }
+        }
+    }
+}

@@ -1,0 +1,45 @@
+#!/bin/sh
+# /etc/hotplug.d/iface/99-portal-login
+#
+# 触发时机：WAN 接口 ifup 事件
+# 与 Clash/passwall 无冲突：本脚本只处理 WAN 侧 portal 认证
+
+[ "$ACTION" = "ifup" ] || exit 0
+
+# 只响应主 WAN 接口（wan6 不需要，portal 认证只用 IPv4）
+case "$INTERFACE" in
+    wan|pppoe-wan) ;;
+    *) exit 0 ;;
+esac
+
+# 防止短时间内重复触发（60秒内只处理一次）
+LOCK="/tmp/portal-login-hotplug.lock"
+if [ -f "$LOCK" ]; then
+    lock_age=$(( $(date +%s) - $(date -r "$LOCK" +%s 2>/dev/null || echo 0) ))
+    [ "$lock_age" -lt 60 ] && exit 0
+fi
+touch "$LOCK"
+
+logger -t portal-login "WAN ifup: INTERFACE=$INTERFACE DEVICE=$DEVICE"
+
+# 等接口获得 IP
+sleep 5
+
+# 检查 procd 服务状态（比 PID 文件更可靠）
+if /etc/init.d/portal-login running >/dev/null 2>&1; then
+    logger -t portal-login "守护进程运行中，probe 循环自动处理"
+    exit 0
+fi
+
+# 再用 PID 文件兜底（procd running 命令不一定所有版本都支持）
+PID_FILE="/var/run/portal-login.pid"
+if [ -f "$PID_FILE" ]; then
+    pid=$(cat "$PID_FILE")
+    if kill -0 "$pid" 2>/dev/null; then
+        logger -t portal-login "守护进程运行中 (PID $pid)"
+        exit 0
+    fi
+fi
+
+logger -t portal-login "守护进程未运行，启动..."
+/etc/init.d/portal-login start

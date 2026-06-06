@@ -1,0 +1,20 @@
+{
+    "admin/services/portal-login": {
+        "title": "Portal 自动登录",
+        "order": 60,
+        "action": {
+            "type": "firstchild"
+        },
+        "depends": {
+            "acl": [ "luci-app-portal-login" ]
+        }
+    },
+    "admin/services/portal-login/main": {
+        "title": "Portal 自动登录",
+        "order": 1,
+        "action": {
+            "type": "view",
+            "path": "portal-login"
+        }
+    }
+}
