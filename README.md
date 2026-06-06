@@ -2,7 +2,7 @@
 
 OpenWrt 校园网 Portal 自动认证插件 — 纯 Shell 实现，LuCI 原生界面
 
-测试于**沈阳建筑大学(SJZU)**的中国移动登录门户。
+测试于沈阳建筑大学(SJZU)的中国移动登录门户。
 
 <img width="612" height="525" alt="image" src="https://github.com/user-attachments/assets/cfb6e855-da6a-4d42-aa8a-24d3eff77ee0" />
 
