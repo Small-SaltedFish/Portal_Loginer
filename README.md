@@ -119,7 +119,7 @@ portal-login test-encrypt   # 测试 AES 加密
 | 监听端口 | 无（纯客户端） | 7890 等 |
 | 冲突 | 无 | 无 |
 
-> **注意**：如果代理工具开启了"路由器本身走代理"，portal-login 的 curl 可能被劫持导致超时。建议关闭路由器本身的代理，或在代理工具中将 portal 相关 IP 加入直连列表。若采用国内外分流（如Clash国内流量不进入内核），可以考虑使用http://connect.rom.miui.com/generate_204等国内验证连通性url。
+> **注意**：如果代理工具开启了"路由器本身走代理"，portal-login 的 curl 可能被劫持导致超时。建议关闭路由器本身的代理，或在代理工具中将 portal 相关 IP 加入直连列表。若采用国内外分流（如Clash国内流量不进入内核），可以考虑使用 http://connect.rom.miui.com/generate_204 等国内验证连通性url。
 
 ## 卸载
 
