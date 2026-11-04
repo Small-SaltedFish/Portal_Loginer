@@ -12,7 +12,7 @@
 #   &clientip=10.17.231.135&wlanacname=hn&clientmac=d8:bb:c1:9e:7b:1b
 #   &paip=172.16.100.200&vlan=1407.1051&iarmdst=140.143.144.103:8082/
 
-readonly VERSION="1.4.0"
+readonly VERSION="1.4.1"
 umask 077
 readonly PROG="portal-login"
 
@@ -33,7 +33,9 @@ CFG_RELOGIN_HOUR=4        # 每天几点强制重新登录 (0-23，-1 禁用)
 CFG_LOG_MAX=500
 CFG_ENABLED=1
 CFG_DEBUG=0
-CFG_DIRECT_TOS=""        # 可选：与 OpenClash 原生 DSCP 绕过规则配套，168 对应 DSCP 42
+NET_MODE=system
+NET_HELPER=/usr/libexec/portal-login-net
+NET_ERROR=""
 PROBE_REASON=""
 
 # 运行时 portal 参数（每次 probe 后更新）
@@ -175,7 +177,6 @@ load_cfg() {
     v=$(uci -q get portal_login.main.relogin_hour 2>/dev/null);   [ -n "$v" ] && CFG_RELOGIN_HOUR="$v"
     v=$(uci -q get portal_login.main.log_max 2>/dev/null);        [ -n "$v" ] && [ "$v" -ge 50 ] 2>/dev/null && CFG_LOG_MAX="$v"
     v=$(uci -q get portal_login.main.debug 2>/dev/null);          [ -n "$v" ] && CFG_DEBUG="$v"
-    v=$(uci -q get portal_login.main.direct_tos 2>/dev/null);     [ -n "$v" ] && CFG_DIRECT_TOS="$v"
     # 配置加载诊断（始终输出到 stderr，不受 debug 开关控制）
     [ -z "$CFG_USER" ] && echo "load_cfg: 警告 - user 为空，检查 uci get portal_login.main.user" >&2
 }
@@ -195,59 +196,111 @@ validate_cfg() {
     case "$CFG_KEY" in *[!A-Za-z0-9]*) echo "AES 密钥只支持 ASCII 字母数字" >&2; return 1 ;; esac
     case "$CFG_PROBE_URL" in http://?*) ;; *) echo "探针必须为 HTTP 地址" >&2; return 1 ;; esac
     case "$CFG_PROBE_URL" in *[[:space:]]*|*\#*) echo "探针地址包含无效字符" >&2; return 1 ;; esac
-    [ -z "$CFG_DIRECT_TOS" ] || [ "$CFG_DIRECT_TOS" = 168 ] || { echo "直连流量标记应为 168 或留空" >&2; return 1; }
 }
 
 _has_openclash() { [ -x /etc/init.d/openclash ]; }
-_openclash_rules_active() {
-    nft list chain inet fw4 openclash_output >/dev/null 2>&1 ||
-        nft list chain inet fw4 openclash_mangle_output >/dev/null 2>&1
-}
 
 _direct_curl() {
-    # --noproxy 仅禁用显式代理。TOS 标记须与防火墙原生 RETURN 配套，不能单独承诺直连。
-    if [ -n "$CFG_DIRECT_TOS" ] && _has_openclash; then
-        curl -4 --noproxy '*' --ip-tos "$CFG_DIRECT_TOS" "$@"
-    else
-        curl -4 --noproxy '*' "$@"
-    fi
-}
-
-_direct_channel_ready() {
-    # 独立通道失效时宁可显示未确认，也不能借代理拿到 204 后误报校园网正常。
-    _has_openclash || return 0
-    if [ -z "$CFG_DIRECT_TOS" ]; then
-        if [ "$(uci -q get openclash.config.router_self_proxy 2>/dev/null)" = 1 ]; then
-            # 仅安装但已停止 OpenClash 时，不因残留开关阻止正常直连。
-            if command -v nft >/dev/null 2>&1 && ! _openclash_rules_active; then return 0; fi
-            return 1
-        fi
-        return 0
-    fi
-    [ "$CFG_DIRECT_TOS" = 168 ] || return 1
-    command -v nft >/dev/null 2>&1 || return 1
-    local chain rules
-    for chain in openclash_output openclash_mangle_output; do
-        rules=$(nft list chain inet fw4 "$chain" 2>/dev/null) || continue
-        printf '%s\n' "$rules" | awk '
-            /PortalLogin_Direct_42/ && /return/ && /skuid (0|root)/ && /dscp (0x2a|42)/ {found=1}
-            END {exit !found}
-        ' || return 1
-    done
-    return 0
-}
-
-_probe_url_direct_ready() {
-    _has_openclash || return 0
-    if command -v nft >/dev/null 2>&1 && ! _openclash_rules_active; then return 0; fi
-    [ -n "$CFG_DIRECT_TOS" ] || return 0
-    local host="${1#http://}"
-    host=${host%%/*}; host=${host%%:*}
+    _network_prepare || return 69
+    local url authority host port address argument
+    for argument in "$@"; do url="$argument"; done
+    case "$url" in http://*) authority=${url#http://}; port=80 ;; https://*) authority=${url#https://}; port=443 ;; *) return 3 ;; esac
+    authority=${authority%%/*}; authority=${authority%%\?*}
+    case "$authority" in *'@'*|*[!A-Za-z0-9.:-]*) return 3 ;; esac
+    host=${authority%%:*}
+    case "$host" in ''|-*|.*|*..*) return 3 ;; esac
+    case "$authority" in *:*) port=${authority#*:}; _range "$port" 1 65535 || return 3 ;; esac
     if _valid_ipv4 "$host"; then
-        case "$host" in 198.18.*|198.19.*) return 1 ;; *) return 0 ;; esac
+        _network_run curl -q -4 --noproxy '*' "$@"
+    else
+        address=$(_network_resolve "$host") || return 6
+        # curl 保留原域名/Host/TLS 校验，只跳过会被本机代理影响的系统解析。
+        _network_run curl -q -4 --noproxy '*' --resolve "$host:$port:$address" "$@"
     fi
-    # 未注册的自定义域名可能得到 Fake-IP，不能把它当独立直连探针。
-    grep -Fqx "$host" /etc/openclash/custom/openclash_custom_domain_dns.list 2>/dev/null
+}
+
+_network_prepare() {
+    NET_MODE=system; NET_ERROR=""
+    _has_openclash || return 0
+    local chain rules active=0 table
+    if command -v nft >/dev/null 2>&1; then
+        for chain in openclash_output openclash_mangle_output; do
+            rules=$(nft -n list chain inet fw4 "$chain" 2>/dev/null) || continue
+            active=1
+            printf '%s\n' "$rules" | awk '/skgid 65534/ && /return/ && !/skgid !=/ {ok=1} END {exit !ok}' || {
+                NET_ERROR="当前 OpenClash 防火墙没有可用的进程绕过机制"; return 1;
+            }
+        done
+        rules=$(nft -n list chain inet fw4 nat_output 2>/dev/null | grep 'OpenClash Router DNS Hijack') || :
+        if [ -n "$rules" ]; then
+            active=1
+            printf '%s\n' "$rules" | awk '!/skgid != 65534/ {bad=1} END {exit bad}' || {
+                NET_ERROR="当前 OpenClash DNS 重定向没有进程组绕过"; return 1;
+            }
+        fi
+    fi
+    if [ "$active" = 0 ] && command -v iptables >/dev/null 2>&1; then
+        for table in nat mangle; do
+            rules=$(iptables -t "$table" -S openclash_output 2>/dev/null) || continue
+            active=1
+            printf '%s\n' "$rules" | grep -q -- '--gid-owner 65534 -j RETURN' || {
+                NET_ERROR="当前 OpenClash 防火墙不支持进程组绕过"; return 1;
+            }
+        done
+        rules=$(iptables -t nat -S OUTPUT 2>/dev/null | grep 'OpenClash Router DNS Hijack') || :
+        if [ -n "$rules" ]; then
+            active=1
+            printf '%s\n' "$rules" | awk '!/! --gid-owner 65534/ {bad=1} END {exit bad}' || {
+                NET_ERROR="当前 OpenClash DNS 重定向不支持进程组绕过"; return 1;
+            }
+        fi
+    fi
+    [ "$active" != 0 ] || return 0
+    if ! command -v ruby >/dev/null 2>&1 || [ ! -r "$NET_HELPER" ] || ! ruby "$NET_HELPER" check 2>/dev/null; then
+        NET_ERROR="无法启动独立网络请求，请检查 OpenClash 的 Ruby 依赖和插件文件"; return 1
+    fi
+    NET_MODE=openclash-owner
+}
+
+_network_run() {
+    local operation="$1"; shift
+    if [ "$NET_MODE" = openclash-owner ]; then
+        ruby "$NET_HELPER" "$operation" "$@"
+    else
+        case "$operation" in
+            curl) curl "$@" ;;
+            lookup) busybox nslookup -type=A -timeout=2 -retry=1 "$@" ;;
+            *) return 64 ;;
+        esac
+    fi
+}
+
+_network_dns_servers() {
+    # 只读取 WAN 的上游，不改写系统或其他插件的 DNS。
+    ubus -S call network.interface.wan status 2>/dev/null | jsonfilter -e '@["dns-server"][*]' 2>/dev/null
+    printf '%s\n' 223.5.5.5 119.29.29.29
+}
+
+_network_resolve() {
+    local host="$1" server result address seen=" "
+    for server in $(_network_dns_servers); do
+        _valid_ipv4 "$server" || continue
+        case "$server" in 0.*|127.*|198.18.*|198.19.*) continue ;; esac
+        case "$seen" in *" $server "*) continue ;; esac
+        seen="$seen$server "
+        # 本机地址不能充当独立上游（例如指向本机 dnsmasq/Mihomo）。
+        case "$(ip -4 route get "$server" 2>/dev/null)" in local\ *) continue ;; esac
+        result=$(_network_run lookup "$host" "$server" 2>/dev/null) || continue
+        for address in $(printf '%s\n' "$result" | awk '
+            /^Name:/ {answer=1; next}
+            answer && /^Address([[:space:]][0-9]+)?:[[:space:]]/ {sub(/^[^:]*:[[:space:]]*/, ""); sub(/#.*/, ""); print $1}
+        '); do
+            _valid_ipv4 "$address" || continue
+            case "$address" in 0.*|127.*|198.18.*|198.19.*|169.254.*|22[4-9].*|23[0-9].*|24[0-9].*|25[0-5].*) continue ;; esac
+            printf '%s\n' "$address"; return 0
+        done
+    done
+    return 1
 }
 
 _json_field() { printf '%s' "$1" | jsonfilter -e "@.$2" 2>/dev/null; }
@@ -433,23 +486,21 @@ probe_portal() {
     local result http_code redirect_url probe_url curl_rc wan_ip
     PROBE_REASON=""
     st_set PROBE_URL "$CFG_PROBE_URL"
-    if [ -n "$CFG_DIRECT_TOS" ] && _has_openclash; then st_set TRANSPORT marked-direct;
-    else st_set TRANSPORT system-direct; fi
     wan_ip=$(_get_wan_ip)
     [ -n "$wan_ip" ] || return 2
     _wan_route_ready "$wan_ip" || return 4
-    _direct_channel_ready || {
+    _network_prepare || {
         st_set TRANSPORT unavailable
-        PROBE_REASON="独立直连规则未就绪，拒绝借代理探测校园网络"
+        PROBE_REASON="$NET_ERROR"
         log_w "$PROBE_REASON"; return 3;
     }
+    st_set TRANSPORT "$NET_MODE"
 
     # 依次尝试国内 HTTP 探针，保留 AC 的 302 拦截能力。
-    # 这些域名另在 OpenClash 第二 DNS 和直连例外中配置，避免依赖代理节点。
+    # 域名直接询问 WAN 上游，不要求 OpenClash 配套域名名单。
     for probe_url in "$CFG_PROBE_URL" \
         "http://connectivitycheck.platform.hicloud.com/generate_204" \
         "http://wifi.vivo.com.cn/generate_204"; do
-        _probe_url_direct_ready "$probe_url" || { log_d "跳过未配置独立 DNS 的自定义探针"; continue; }
         result=$(_direct_curl -s \
             --connect-timeout 4 --max-time 6 --max-redirs 0 \
             -o /dev/null -w "%{http_code} %{redirect_url}" \

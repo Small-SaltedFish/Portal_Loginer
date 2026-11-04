@@ -75,7 +75,7 @@ method_get_config() {
     json_init
     json_add_boolean has_pass "$has_pass"
     json_add_boolean has_openclash "$has_openclash"
-    for name in user key probe_url check_interval retry_interval relogin_hour log_max debug enabled direct_tos; do
+    for name in user key probe_url check_interval retry_interval relogin_hour log_max debug enabled; do
         json_add_string "$name" "$(uci_get "$name")"
     done
     json_dump
@@ -99,13 +99,7 @@ method_set_config() {
                 case "$value" in http://?*) case "$value" in *[[:space:]]*|*\#*|*@*) false ;; *) true ;; esac ;; *) false ;; esac || {
                     reply error "探针须为不含账号的 HTTP 204 地址"; return;
                 }
-                if [ -x /etc/init.d/openclash ] && [ "$(uci_get direct_tos)" = 168 ]; then
-                    local probe_host="${value#http://}"
-                    probe_host=${probe_host%%/*}; probe_host=${probe_host%%:*}
-                    if ! grep -Fqx "$probe_host" /etc/openclash/custom/openclash_custom_domain_dns.list 2>/dev/null; then
-                        reply error "请先将主探针域名加入 OpenClash 的第二 DNS 域名列表，再保存；当前设置未改变"; return;
-                    fi
-                fi ;;
+                ;;
             check_interval) range "$value" 5 600 ;;
             retry_interval) range "$value" 3 300 ;;
             relogin_hour) [ "$value" = -1 ] || range "$value" 0 23 ;;

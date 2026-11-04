@@ -24,4 +24,9 @@ for path in usr/bin/portal-login usr/libexec/rpcd/portal-login etc/init.d/portal
     sh -n "$root/data/$path"
 done
 echo 'PASS executable modes and package shell syntax'
-echo 'RESULT 4 passed, 0 failed'
+[ "$(stat -c '%a' "$root/data/usr/libexec/portal-login-net")" = 755 ]
+if command -v ruby >/dev/null 2>&1; then
+    ruby -c "$root/data/usr/libexec/portal-login-net"
+fi
+echo 'PASS network helper is packaged executable'
+echo 'RESULT 5 passed, 0 failed'

@@ -333,9 +333,7 @@ return view.extend({
             sc('debug',     c.debug);
             var compat=self.$('compat-note'), compatText=self.$('compat-text');
             if(compat) compat.style.display=c.has_openclash?'block':'none';
-            if(compatText) compatText.textContent=c.direct_tos==='168'
-                ? '本插件已启用独立请求标记，仍需配套的 OpenClash 绕过规则和独立 DNS。更换主探针域名前请同步配置；规则失效时会明确报错。'
-                : '检测到 OpenClash。开启路由器本机代理前，请先完成探针绕过与独立 DNS 配置，避免代理故障影响认证判断。';
+            if(compatText) compatText.textContent='插件会自动检查并使用现有的出站绕过机制，不修改 OpenClash 配置。若环境不支持，页面和日志会提示原因。';
         }).catch(function(){});
     },
 
@@ -452,7 +450,7 @@ return view.extend({
             self.mk('div',{id:'compat-note',style:'display:none;margin-bottom:16px;padding:12px;border-left:4px solid #eab308;background:rgba(234,179,8,.12);line-height:1.7'},[
                 self.mk('b',{txt:'OpenClash 共存提醒'}),
                 self.mk('div',{id:'compat-text'}),
-                self.mk('a',{href:'https://github.com/Small-SaltedFish/Portal_Loginer/blob/main/docs/OPENCLASH.md',target:'_blank',rel:'noopener noreferrer',style:'font-weight:600;text-decoration:underline',txt:'查看配置步骤、字段填写及验证方法 ↗'})
+                self.mk('a',{href:'https://github.com/Small-SaltedFish/Portal_Loginer/blob/main/docs/OPENCLASH.md',target:'_blank',rel:'noopener noreferrer',style:'font-weight:600;text-decoration:underline',txt:'查看代理环境使用说明 ↗'})
             ]),
             self.mk('div',{cls:'pl-sec',txt:'账号凭据'}),
             self.mk('div',{cls:'pl-fg2'},[
@@ -463,7 +461,7 @@ return view.extend({
             self.mk('div',{cls:'pl-sec',txt:'Portal 参数'}),
             self.mk('div',{cls:'pl-fg2'},[
                 self.fg('主探针 URL', probeInp,
-                    '优先检查此 HTTP 204 地址；未确认时依次尝试华为、vivo。独立通道下改域名须先加入 OpenClash 第二 DNS 列表'),
+                    '优先检查此 HTTP 204 地址；未确认时依次尝试华为、vivo。更换地址不需要修改 OpenClash 域名列表'),
                 self.fg('AES 加密密钥（16位，留空不修改）',
                     self.inp('key','text','留空保持现有密钥',{maxlength:'16'}),
                     '默认 5a3b9f207411a8ed；无法确认门户新密钥时保留当前值')

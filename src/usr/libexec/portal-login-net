@@ -1,0 +1,23 @@
+#!/usr/bin/ruby
+# Use OpenClash's existing socket-group exemption. No firewall/config writes.
+operation = ARGV.shift
+unless %w[check curl lookup].include?(operation)
+  warn 'unsupported network operation'
+  exit 64
+end
+begin
+  Process::GID.change_privilege(65534)
+  raise 'group change failed' unless Process.egid == 65534
+  case operation
+  when 'check'
+    exit 0
+  when 'curl'
+    exec('/usr/bin/curl', *ARGV)
+  when 'lookup'
+    exit 64 unless ARGV.length == 2
+    exec('/bin/busybox', 'nslookup', '-type=A', '-timeout=2', '-retry=1', *ARGV)
+  end
+rescue SystemCallError, RuntimeError
+  warn 'cannot start independent network request'
+  exit 69
+end

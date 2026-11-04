@@ -24,6 +24,8 @@ log_i() { :; }; log_d() { :; }; log_w() { :; }; log_e() { :; }
 _save_params_uci() { :; }
 uci() { return 1; }
 encrypt_pass() { printf '%s\n' encrypted-fixture; }
+_network_prepare() { NET_MODE=system; return 0; }
+_network_resolve() { echo 203.0.113.10; }
 # On OpenWrt, use the actual jsonfilter parser. Windows Git Bash uses Node for fixtures.
 if ! command -v jsonfilter >/dev/null 2>&1; then
     jsonfilter() { node tests/jsonfilter.cjs "$@"; }
@@ -111,35 +113,5 @@ CFG_RETRY_INTERVAL=08
 expect 'config/reject-octal-like-number' 1 validate_cfg
 CFG_RETRY_INTERVAL=3
 expect 'config/valid' 0 validate_cfg
-CFG_DIRECT_TOS=168
-oc_present=1
-_has_openclash() { [ "$oc_present" = 1 ]; }
-firewall_case=ready
-nft() {
-    case "$firewall_case" in
-        ready) echo 'tcp sport 0-65535 meta skuid 0 ip dscp 0x2a ip daddr != 198.18.0.0/16 counter packets 1 bytes 60 return comment "PortalLogin_Direct_42"' ;;
-        missing) echo 'ip protocol tcp counter redirect to :7892' ;;
-        wrongmark) echo 'meta skuid 0 ip dscp 0x08 return comment "PortalLogin_Direct_42"' ;;
-        stopped) return 1 ;;
-    esac
-}
-expect 'transport/native-rule-present' 0 _direct_channel_ready
-firewall_case=missing
-expect 'transport/refuse-missing-rule' 1 _direct_channel_ready
-firewall_case=wrongmark
-expect 'transport/refuse-wrong-mark' 1 _direct_channel_ready
-firewall_case=stopped
-expect 'transport/no-proxy-chains-direct' 0 _direct_channel_ready
-expect 'transport/stopped-openclash-custom-probe' 0 _probe_url_direct_ready http://custom.example/generate_204
-CFG_DIRECT_TOS=""
-uci() { echo 1; }
-expect 'transport/stopped-openclash-without-mark' 0 _direct_channel_ready
-CFG_DIRECT_TOS=168
-oc_present=0
-expect 'transport/no-openclash-direct' 0 _direct_channel_ready
-expect 'transport/no-openclash-custom-probe' 0 _probe_url_direct_ready http://custom.example/generate_204
-curl() { for argument in "$@"; do [ "$argument" != --ip-tos ] || return 1; done; return 0; }
-expect 'transport/no-openclash-no-mark' 0 _direct_curl -s http://custom.example/generate_204
-CFG_DIRECT_TOS=""
 echo "RESULT $passed passed, $failed failed"
 [ "$failed" = 0 ]

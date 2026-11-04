@@ -1,12 +1,13 @@
 # Portal Loginer 开发者说明
 
-本文对应 1.4.0 代码，供开发和维护使用。内部审查见 [开发记录](docs/development/REVIEW.md)，旧实现以 Git 历史为准。
+本文对应 1.4.1 代码，供开发和维护使用。内部审查见 [开发记录](docs/development/REVIEW.md)，旧实现以 Git 历史为准。
 
 ## 1. 文件与职责
 
 | 文件 | 职责 |
 |---|---|
 | `/usr/bin/portal-login` | 配置读取、WAN 就绪、探测、认证、状态机与 CLI |
+| `/usr/libexec/portal-login-net` | 以 GID 65534 执行独立 curl / DNS 请求，仅在已验证的 OpenClash 环境使用 |
 | `/usr/libexec/rpcd/portal-login` | LuCI RPC、JSON 序列化、配置验证、服务操作 |
 | `/etc/init.d/portal-login` | procd 生命周期、UCI reload trigger |
 | `/etc/hotplug.d/iface/99-portal-login` | WAN ifup 后检查守护进程，未运行时启动 |
@@ -103,18 +104,19 @@ stateDiagram-v2
 rpcd get_status 只读取状态，并据实际进程计算 running/STOPPED，不写回主程序状态文件。
 账号密码不写入状态文件；日志可能包含账号、内网地址和服务器错误信息，应按现场敏感资料保留。
 
-## 6. OpenClash 探针绕过
+## 6. OpenClash 自动适配
 
-`direct_tos` 留空时使用系统出口；配置为 168 时，curl 的 IPv4 TOS=168，对应 DSCP=42、ECN=0。
-OpenClash 原生来源流量控制按 root UID + DSCP42，在 OUTPUT 代理链顶部 RETURN，绕过 REDIRECT/TPROXY/TUN 标记。
-规则备注使用 `PortalLogin_Direct_42`。插件检查当前代理链中的 UID、DSCP、RETURN 和备注，缺失或不匹配时拒绝借代理探测。
-OpenClash 停止且代理链不存在时，自身请求正常直接发出。该集成已在本次设备的 Fake-IP 非 TUN 路径测试；其他固件和传输模式需要验证实际规则。
+`_network_prepare()` 读取实际防火墙链：fw4 检查 `openclash_output`、`openclash_mangle_output`，fw3 检查 nat/mangle 的 `openclash_output`。存在的代理链必须包含 GID 65534 的 RETURN 规则；仅有旧 DSCP 规则不算支持。同时检查带 OpenClash 注释的 DNS OUTPUT 重定向是否排除 GID 65534；只有 DNS 重定向时也选择独立请求。没有活动代理链或 DNS 重定向时使用普通网络。
 
-DNS 同样要独立：第二 DNS 为三个探针域名返回真实地址，其上游 IP 也需在本机绕过地址中。
-配置列表以外的自定义探针可能得到 Fake-IP，因此兼容模式下配置保存会先检查域名是否在独立 DNS 列表。
-这些规则由 OpenClash 自身重建，不修改订阅、模板或内核文件。
+匹配后，Ruby 辅助程序通过 `Process::GID.change_privilege(65534)` 改变子进程组，再以参数数组 exec curl 或 BusyBox nslookup。只有网络子进程改变组，主守护进程、配置权限与其他服务不变。Ruby 是此适配的运行条件，无 OpenClash 时不要求安装 Ruby。缺失依赖、缺失绕过规则会返回明确错误，不自动写防火墙或退回借代理探测。
 
-运维 DNS 例外仅涉及列明的域名。外网浏览域名如何加密解析、是否经代理及 LAN DNS 劫持属于 OpenClash 的另外一层配置，不能把探针例外称为全局零 DNS 泄漏。
+OpenClash 上游的 IPv4 DNS OUTPUT 重定向同样排除 GID 65534。解析不走本机系统 DNS：按 WAN `dns-server`、223.5.5.5、119.29.29.29 顺序查询 A 记录，去重并跳过本机上游。BusyBox nslookup 每个服务器超时 2 秒、一次尝试；解析结果过滤无效地址、回环、Fake-IP、链路本地和组播地址。不把服务器自身的 Address 行当作域名结果。
+
+curl 使用 `-q -4 --noproxy '*' --resolve host:port:IP`，保留原域名、Host 和 TLS 校验，禁用 curlrc 与显式代理；IPv4 字面量不查询 DNS。HTTP 探针保持不跟随重定向，才能识别 AC 的认证跳转。所有探针、获取门户页面及登录/确认/注销 API 共用这一路径。
+
+该适配针对上游 OpenClash 的 socket GID 机制，不宣称支持任意透明代理、VPN、额外策略路由或修改后的 DNS 劫持规则。旧 `direct_tos` 被忽略，不再发送 DSCP；不自动删除旧 OpenClash 配置，因为它可能有其他用途。
+
+实现参考：[OpenClash 启动脚本](https://github.com/vernesong/OpenClash/blob/dev/luci-app-openclash/root/etc/init.d/openclash)、[Ruby Process::GID](https://docs.ruby-lang.org/en/master/Process/GID.html#method-c-change_privilege)。
 
 ## 7. UCI 与 LuCI
 
@@ -125,13 +127,12 @@ DNS 同样要独立：第二 DNS 为三个探针域名返回真实地址，其�
 | enabled | 1 | 0/1；服务启动开关，面板保存同步 init 启动项 |
 | user / pass | 空 | 账号/密码；面板空密码保留已有值 |
 | key | 项目默认密钥 | 16 位 ASCII 字母数字；空值保留 |
-| probe_url | 小米 generate_204 | HTTP 204 主探针；兼容模式下还要注册独立 DNS |
+| probe_url | 小米 generate_204 | HTTP 204 主探针；无需额外登记 DNS |
 | check_interval | 30 | 5–600 秒 |
 | retry_interval | 10 | 3–300 秒；认证失败退避上限 300 |
 | relogin_hour | 4 | -1 或 0–23；原设置升级保留 |
 | log_max | 500 | 50–5000 |
 | debug | 0 | 0/1 |
-| direct_tos | 空 | 可选 OpenClash 集成值 168；页面只在检测到 OpenClash 时提醒并链接文档，不增加“通道”显示或选择器 |
 | last_* | 自动 | 缓存门户参数，使用前检查当前 WAN，不能充当认证失效证据 |
 
 rpcd 方法：get_status、get_logs(lines)、get_config、set_config、do_action(action)。
@@ -147,7 +148,8 @@ JSON 使用系统 jshn 解析/序列化；缺失或畸形数字不会生成无�
 
 隔离测试：
 
-- core.sh：探针、认证、WAN/参数、状态写入、配置范围与通道规则。
+- core.sh：探针、认证、WAN/参数、状态写入、配置范围。
+- network.sh：自动识别 fw4/fw3、能力缺失、DNS 失败回退、Fake-IP 过滤、自定义域名与 curl 参数。
 - rpc.sh：真实 jshn/jsonfilter/UCI 下的 JSON、只读状态、整体验证、保留密码和启动项操作；使用私有配置与 init 替身。
 - locking.sh：真实 flock 的并发、描述符关闭、inode 和进程退出。
 - daemon.sh：受控时钟下无地址→无路由→稳定→一次认证→在线不重复认证。

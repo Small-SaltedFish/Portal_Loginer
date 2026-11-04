@@ -24,6 +24,7 @@ done
 
 chmod 755 "$BUILD_DIR/data/usr/bin/portal-login"
 chmod 755 "$BUILD_DIR/data/usr/libexec/rpcd/portal-login"
+chmod 755 "$BUILD_DIR/data/usr/libexec/portal-login-net"
 chmod 755 "$BUILD_DIR/data/etc/init.d/portal-login"
 chmod 755 "$BUILD_DIR/data/etc/hotplug.d/iface/99-portal-login"
 chmod 600 "$BUILD_DIR/data/etc/config/portal_login"
