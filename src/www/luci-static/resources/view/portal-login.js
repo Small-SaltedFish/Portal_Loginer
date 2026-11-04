@@ -224,25 +224,9 @@ return view.extend({
         });
     },
 
-    /* 重启 = restart + relogin */
+    /* 重启只重载守护进程；强制登出/重认证由独立按钮负责。 */
     actRestart: function(){
-        var self = this;
-        var btns = self._root ? self._root.querySelectorAll('.pl-btn') : [];
-        btns.forEach(function(b){ b.disabled=true; });
-        self.toast('重启中...', true);
-        callAct('restart').then(function(){
-            return new Promise(function(res){ setTimeout(res, 2000); });
-        }).then(function(){
-            return callAct('relogin');
-        }).then(function(r){
-            self.toast('重启完成，'+( r.msg||'重新登录中'), true);
-            setTimeout(function(){ self.doStatus(); }, 600);
-            setTimeout(function(){ self.doStatus(); }, 3000);
-        }).catch(function(e){
-            self.toast('重启失败: '+e.message, false);
-        }).finally(function(){
-            btns.forEach(function(b){ b.disabled=false; });
-        });
+        this.act('restart', '守护进程已重启');
     },
 
     /* ── 实时刷新 ── */
@@ -264,17 +248,23 @@ return view.extend({
             var dotCls='pl-dot-off', bdgCls='pl-off', lbl='—', procTxt='';
             switch(st){
                 case 'LOGGED_IN':
-                    dotCls='pl-dot-ok'; bdgCls='pl-ok'; lbl='已登录 ✓'; break;
+                    dotCls='pl-dot-ok'; bdgCls='pl-ok'; lbl='网络在线 ✓'; break;
                 case 'LOGGING_IN':
                     dotCls='pl-dot-wn'; bdgCls='pl-wn'; lbl='登录中...'; break;
                 case 'FAILED':
                     dotCls='pl-dot-er'; bdgCls='pl-er'; lbl='登录失败'; break;
+                case 'VERIFYING':
+                    dotCls='pl-dot-wn'; bdgCls='pl-wn'; lbl='认证已提交，等待联网确认'; break;
+                case 'PROBE_UNKNOWN':
+                    dotCls='pl-dot-wn'; bdgCls='pl-wn'; lbl='探测未确认，保留会话'; break;
+                case 'WAIT_NETWORK':
+                    dotCls='pl-dot-wn'; bdgCls='pl-wn'; lbl='等待 WAN 地址和出口就绪'; break;
                 case 'OFFLINE':
                     dotCls='pl-dot-off'; bdgCls='pl-off'; lbl='网络离线'; break;
                 case 'STOPPED':
                     dotCls='pl-dot-off'; bdgCls='pl-off'; lbl='服务停止'; break;
                 default:
-                    lbl=st||'—';
+                    lbl='等待检查';
             }
             procTxt = s.running
                 ? '<span style="color:#22c55e;font-weight:500">守护进程运行中</span>'
@@ -294,6 +284,7 @@ return view.extend({
             sv('p-vlan',     s.p_vlan);
             sv('last-login', s.last_login);
             sv('last-check', s.last_check);
+            sv('version', s.version);
 
             var ee=self.$('err');
             if (ee){ ee.textContent=s.error||''; ee.style.display=s.error?'block':'none'; }
@@ -303,7 +294,7 @@ return view.extend({
     doLogs: function(){
         var self = this;
         callLogs(self._n).then(function(r){
-            var raw = (r.lines||'').replace(/\\n/g,'\n').trimEnd();
+            var raw = (r.lines||'').trimEnd();
             if (raw === self._prevLog) return;
             self._prevLog = raw;
             var box=self.$('log');
@@ -340,6 +331,11 @@ return view.extend({
             function sc(id,v){ var e=self.$(id); if(e) e.checked=(v==='1'||v===1||v===true); }
             sc('autostart', c.enabled);
             sc('debug',     c.debug);
+            var compat=self.$('compat-note'), compatText=self.$('compat-text');
+            if(compat) compat.style.display=c.has_openclash?'block':'none';
+            if(compatText) compatText.textContent=c.direct_tos==='168'
+                ? '本插件已启用独立请求标记，仍需配套的 OpenClash 绕过规则和独立 DNS。更换主探针域名前请同步配置；规则失效时会明确报错。'
+                : '检测到 OpenClash。开启路由器本机代理前，请先完成探针绕过与独立 DNS 配置，避免代理故障影响认证判断。';
         }).catch(function(){});
     },
 
@@ -349,15 +345,30 @@ return view.extend({
         function gc(id){ var e=self.$(id); return e&&e.checked?1:0; }
         var rh=parseInt(gv('rh')); if(isNaN(rh)) rh=4;
         var lm=parseInt(gv('logmax')); if(isNaN(lm)||lm<50) lm=200;
+        function number(id,min,max,label){
+            var raw=gv(id).trim(), n=Number(raw);
+            if(!/^-?\d+$/.test(raw)||!Number.isInteger(n)||n<min||n>max)
+                throw new Error(label+'应为 '+min+' 至 '+max+' 的整数');
+            return n;
+        }
+        var check,retry,key=gv('key');
+        try {
+            check=number('check',5,600,'检测间隔');
+            retry=number('retry',3,300,'重试间隔');
+            rh=number('rh',-1,23,'重登录时间');
+            lm=number('logmax',50,5000,'日志行数');
+            if(key && !/^[A-Za-z0-9]{16}$/.test(key)) throw new Error('AES 密钥应为 16 位字母数字，留空则保留');
+        } catch(e){ self.toast(e.message,false); return; }
         callSet(
             gv('user'), gv('pass'),
-            gv('key').length===16?gv('key'):'',
+            key,
             gv('probe'),
-            parseInt(gv('check'))||30,
-            parseInt(gv('retry'))||10,
+            check,
+            retry,
             rh, lm, gc('debug'), gc('autostart')
         ).then(function(r){
-            self.toast(r.result==='ok'?'配置已保存':'保存失败', r.result==='ok');
+            self.toast(r.msg || (r.result==='ok'?'配置已保存':'保存失败'), r.result==='ok');
+            if (r.result !== 'ok') return;
             var pe=self.$('pass'); if(pe) pe.value='';
             self.loadCfg();
         }).catch(function(e){ self.toast('保存失败: '+e.message, false); });
@@ -401,7 +412,8 @@ return view.extend({
             self.stat('Portal Host','p-host',true),
             self.stat('BRAS','p-bras',true),
             self.stat('分配 IP','p-ip',true),
-            self.stat('VLAN','p-vlan',true)
+            self.stat('VLAN','p-vlan',true),
+            self.stat('插件版本','version',false)
         ]);
         var meta=self.mk('div',{cls:'pl-meta'},[
             self.mk('span',{},[self.mk('span',{txt:'🕐'}),' 上次登录 ',self.mk('b',{id:'last-login',txt:'—'})]),
@@ -419,10 +431,10 @@ return view.extend({
         ]);
         /* 操作说明 */
         var hints=[
-            '立即登录：强制执行一次登录（无论当前状态，先登出再重新认证）',
+            '立即登录：明确需要认证时登录；在线且参数有效时重新认证，可能短暂断网；状态不明时保留会话',
             '启动：启动守护进程，自动探测并保持在线',
             '停止：关闭守护进程，停止所有自动认证',
-            '重启：重启守护进程并立即重新登录'
+            '重启：重新加载守护进程，不主动登出校园网'
         ];
         var hintEl=self.mk('div',{style:'margin-top:10px;font-size:11px;color:var(--pl-sub);line-height:1.8'},
             hints.map(function(h){ return self.mk('div',{txt:'• '+h}); })
@@ -434,9 +446,14 @@ return view.extend({
         var passEl = self.inp('pass','password','留空不修改');
 
         /* 探测 URL */
-        var probeInp=self.inp('probe','text','http://connecttest.com/');
+        var probeInp=self.inp('probe','text','http://connect.rom.miui.com/generate_204');
 
         var cfgBody=self.mk('div',{},[
+            self.mk('div',{id:'compat-note',style:'display:none;margin-bottom:16px;padding:12px;border-left:4px solid #eab308;background:rgba(234,179,8,.12);line-height:1.7'},[
+                self.mk('b',{txt:'OpenClash 共存提醒'}),
+                self.mk('div',{id:'compat-text'}),
+                self.mk('a',{href:'https://github.com/Small-SaltedFish/Portal_Loginer/blob/main/docs/OPENCLASH.md',target:'_blank',rel:'noopener noreferrer',style:'font-weight:600;text-decoration:underline',txt:'查看配置步骤、字段填写及验证方法 ↗'})
+            ]),
             self.mk('div',{cls:'pl-sec',txt:'账号凭据'}),
             self.mk('div',{cls:'pl-fg2'},[
                 self.fg('校园网账号', self.inp('user','text','[学号]@net')),
@@ -445,11 +462,11 @@ return view.extend({
             self.mk('div',{cls:'pl-div'}),
             self.mk('div',{cls:'pl-sec',txt:'Portal 参数'}),
             self.mk('div',{cls:'pl-fg2'},[
-                self.fg('探测 URL', probeInp,
-                    '触发 302 重定向的纯 HTTP 地址，一般无需修改'),
+                self.fg('主探针 URL', probeInp,
+                    '优先检查此 HTTP 204 地址；未确认时依次尝试华为、vivo。独立通道下改域名须先加入 OpenClash 第二 DNS 列表'),
                 self.fg('AES 加密密钥（16位，留空不修改）',
                     self.inp('key','text','留空保持现有密钥',{maxlength:'16'}),
-                    '默认 5a3b9f207411a8ed，程序会自动检测更新')
+                    '默认 5a3b9f207411a8ed；无法确认门户新密钥时保留当前值')
             ]),
             self.mk('div',{cls:'pl-div'}),
             self.mk('div',{cls:'pl-sec',txt:'定时策略'}),
@@ -458,11 +475,11 @@ return view.extend({
                     self.inp('check','number','30',{min:'5',max:'600'}),
                     '建议 30~60 秒'),
                 self.fg('失败重试间隔（秒）',
-                    self.inp('retry','number','10',{min:'5',max:'300'}),
-                    '登录失败后等待时间'),
+                    self.inp('retry','number','10',{min:'3',max:'300'}),
+                    '首次失败等待时间；连续失败逐步延长至最多 300 秒'),
                 self.fg('每日重新登录时间（0~23，-1 禁用）',
                     self.inp('rh','number','4',{min:'-1',max:'23'}),
-                    '如 4 = 每天凌晨 4:00 强制重认证，防会话过期'),
+                    '如 4 = 凌晨 4 点尝试重认证；-1 禁用。只在已确认在线且参数有效时主动登出'),
                 self.fg('日志最大保留行数',
                     self.inp('logmax','number','500',{min:'50',max:'5000'}),
                     '超出后自动清除旧日志，建议 200~500')
@@ -470,8 +487,8 @@ return view.extend({
             self.mk('div',{cls:'pl-div'}),
             self.mk('div',{cls:'pl-sec',txt:'其他'}),
             self.mk('div',{style:'display:flex;flex-direction:column;gap:10px;margin-bottom:14px'},[
-                self.tog('autostart','开机自动启动（路由器重启后自动运行守护进程并认证）'),
-                self.tog('debug',   '调试日志（输出详细的 curl 请求和加密信息，日常无需开启）')
+                self.tog('autostart','启用插件及开机自启（保存后同步启动项，运行配置需重启守护进程）'),
+                self.tog('debug',   '详细探测日志（日常无需开启，不输出明文密码）')
             ]),
             self.mk('div',{cls:'pl-btns'},[
                 self.btn('💾 保存配置','b-blue', function(){ self.saveCfg(); }),

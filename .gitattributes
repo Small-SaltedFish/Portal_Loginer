@@ -1,0 +1,11 @@
+* text=auto
+*.sh text eol=lf
+*.md text eol=lf
+*.js text eol=lf
+*.cjs text eol=lf
+*.json text eol=lf
+src/usr/bin/portal-login text eol=lf
+src/usr/libexec/rpcd/portal-login text eol=lf
+src/etc/init.d/portal-login text eol=lf
+src/etc/hotplug.d/iface/99-portal-login text eol=lf
+src/etc/config/portal_login text eol=lf

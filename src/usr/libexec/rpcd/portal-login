@@ -1,195 +1,173 @@
 #!/bin/sh
-
+umask 077
+. /usr/share/libubox/jshn.sh
 STATUS_FILE="/tmp/portal-login.status"
 LOG_FILE="/tmp/portal-login.log"
 PID_FILE="/var/run/portal-login.pid"
 PROG="/usr/bin/portal-login"
-
-js()    { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
-st_get(){ grep "^${1}=" "$STATUS_FILE" 2>/dev/null | cut -d= -f2-; }
-st_set(){
-    local k v; k="$1"; v="$2"
-    if grep -q "^${k}=" "$STATUS_FILE" 2>/dev/null; then
-        sed -i "s|^${k}=.*|${k}=${v}|" "$STATUS_FILE"
+INIT_SCRIPT="/etc/init.d/portal-login"
+st_get() { grep "^${1}=" "$STATUS_FILE" 2>/dev/null | head -1 | cut -d= -f2-; }
+uint() { case "$1" in ''|*[!0-9]*|0[0-9]*) return 1 ;; esac; [ ${#1} -le 10 ]; }
+range() { uint "$1" && [ "$1" -ge "$2" ] && [ "$1" -le "$3" ]; }
+uci_get() { uci -q get "portal_login.main.$1" 2>/dev/null; }
+reply() {
+    json_init; json_add_string result "$1"; json_add_string msg "$2"; json_dump
+}
+is_running() {
+    local pid
+    pid=$(cat "$PID_FILE" 2>/dev/null)
+    uint "$pid" && [ "$pid" -gt 1 ] && kill -0 "$pid" 2>/dev/null || return 1
+    tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'portal-login.*\(daemon\|start\)'
+}
+list_methods() {
+    cat <<'EOF'
+{"get_status":{},"get_logs":{"lines":0},"get_config":{},"set_config":{"user":"","pass":"","key":"","probe_url":"","check_interval":0,"retry_interval":0,"relogin_hour":0,"log_max":0,"debug":0,"enabled":0},"do_action":{"action":""}}
+EOF
+}
+method_get_status() {
+    local running=0 state ts count now elapsed uptime="" name key login_up up rest last_login
+    state=$(st_get STATE)
+    is_running && running=1
+    [ "$running" = 1 ] || state=STOPPED
+    ts=$(st_get LOGIN_TS); uint "$ts" || ts=0
+    count=$(st_get FAIL_COUNT); range "$count" 0 1000000 || count=0
+    now=$(date +%s)
+    login_up=$(st_get LOGIN_UPTIME)
+    read -r up rest < /proc/uptime
+    up=${up%%.*}
+    last_login=$(st_get LAST_LOGIN)
+    if uint "$login_up" && [ "$login_up" -le "$up" ]; then
+        elapsed=$((up-login_up))
+        ts=$((now-elapsed))
+        uptime=$(printf '%02d:%02d:%02d' "$((elapsed/3600))" "$((elapsed/60%60))" "$((elapsed%60))")
+        # 用当前已校准的墙上时间反推，避免 NTP 校时前记录的时间一直偏移。
+        last_login=$(date -d "@$ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null) || last_login=$(st_get LAST_LOGIN)
+    elif [ "$ts" -gt 0 ] && [ "$ts" -le "$now" ]; then
+        elapsed=$((now-ts))
+        uptime=$(printf '%02d:%02d:%02d' "$((elapsed/3600))" "$((elapsed/60%60))" "$((elapsed%60))")
+    fi
+    json_init
+    json_add_string state "$state"
+    json_add_boolean running "$running"
+    for name in p_host p_bras p_clientip p_vlan last_check error version transport probe_url; do
+        key=$(printf '%s' "$name" | tr 'a-z' 'A-Z')
+        json_add_string "$name" "$(st_get "$key")"
+    done
+    json_add_string last_login "$last_login"
+    json_add_int login_ts "$ts"
+    json_add_int fail_count "$count"
+    json_add_string uptime "$uptime"
+    json_dump
+}
+method_get_logs() {
+    local input n raw=""
+    input=$(cat)
+    json_load "$input" 2>/dev/null || { reply error "请求不是有效 JSON"; return; }
+    json_get_var n lines
+    range "$n" 1 5000 || n=100
+    [ ! -f "$LOG_FILE" ] || raw=$(tail -n "$n" "$LOG_FILE")
+    json_init; json_add_string lines "$raw"; json_dump
+}
+method_get_config() {
+    local has_pass=0 has_openclash=0 name
+    [ -z "$(uci_get pass)" ] || has_pass=1
+    [ ! -x /etc/init.d/openclash ] || has_openclash=1
+    json_init
+    json_add_boolean has_pass "$has_pass"
+    json_add_boolean has_openclash "$has_openclash"
+    for name in user key probe_url check_interval retry_interval relogin_hour log_max debug enabled direct_tos; do
+        json_add_string "$name" "$(uci_get "$name")"
+    done
+    json_dump
+}
+method_set_config() {
+    local input name value type
+    input=$(cat)
+    json_load "$input" 2>/dev/null || { reply error "请求不是有效 JSON"; return; }
+    # 所有字段验证后才写 UCI，空密码/密钥表示保留原值。
+    for name in user pass key probe_url check_interval retry_interval relogin_hour log_max debug enabled; do
+        json_get_type type "$name"
+        [ -n "$type" ] || continue
+        case "$type" in string|int) ;; *) reply error "字段类型无效: $name"; return ;; esac
+        json_get_var value "$name"
+        case "$value" in *[[:cntrl:]]*) reply error "字段不能包含控制字符: $name"; return ;; esac
+        case "$name" in
+            user) [ -n "$value" ] && [ ${#value} -le 128 ] ;;
+            pass) [ ${#value} -le 512 ] ;;
+            key) [ -z "$value" ] || { [ ${#value} -eq 16 ] && case "$value" in *[!A-Za-z0-9]*) false ;; *) true ;; esac; } ;;
+            probe_url)
+                case "$value" in http://?*) case "$value" in *[[:space:]]*|*\#*|*@*) false ;; *) true ;; esac ;; *) false ;; esac || {
+                    reply error "探针须为不含账号的 HTTP 204 地址"; return;
+                }
+                if [ -x /etc/init.d/openclash ] && [ "$(uci_get direct_tos)" = 168 ]; then
+                    local probe_host="${value#http://}"
+                    probe_host=${probe_host%%/*}; probe_host=${probe_host%%:*}
+                    if ! grep -Fqx "$probe_host" /etc/openclash/custom/openclash_custom_domain_dns.list 2>/dev/null; then
+                        reply error "请先将主探针域名加入 OpenClash 的第二 DNS 域名列表，再保存；当前设置未改变"; return;
+                    fi
+                fi ;;
+            check_interval) range "$value" 5 600 ;;
+            retry_interval) range "$value" 3 300 ;;
+            relogin_hour) [ "$value" = -1 ] || range "$value" 0 23 ;;
+            log_max) range "$value" 50 5000 ;;
+            debug|enabled) [ "$value" = 0 ] || [ "$value" = 1 ] ;;
+        esac || { reply error "配置值无效: $name"; return; }
+    done
+    # 私有暂存目录，避免中途失败留下半个请求及明文临时 JSON。
+    local savedir failed=0
+    savedir=$(mktemp -d /tmp/portal-login-uci.XXXXXX) || { reply error "无法建立配置事务"; return; }
+    trap 'rm -rf "$savedir"' EXIT
+    uci -q -t "$savedir" set portal_login.main=portal-login || failed=1
+    for name in user pass key probe_url check_interval retry_interval relogin_hour log_max debug enabled; do
+        json_get_type type "$name"
+        [ -n "$type" ] || continue
+        json_get_var value "$name"
+        case "$name:$value" in pass:|key:) continue ;; esac
+        uci -q -t "$savedir" set "portal_login.main.$name=$value" || failed=1
+    done
+    if [ "$failed" = 0 ] && uci -q -t "$savedir" commit portal_login; then
+        chmod 600 /etc/config/portal_login
+        json_get_var value enabled
+        if [ -n "$value" ] && [ -x "$INIT_SCRIPT" ]; then
+            if [ "$value" = 1 ]; then "$INIT_SCRIPT" enable; else "$INIT_SCRIPT" disable; fi || {
+                rm -rf "$savedir"; trap - EXIT
+                reply error "配置已保存，但开机自启设置失败，请检查日志"; return;
+            }
+        fi
+        reply ok "配置已保存；重启守护进程后生效"
     else
-        echo "${k}=${v}" >> "$STATUS_FILE"
+        reply error "配置保存失败，未应用本次暂存"
     fi
+    rm -rf "$savedir"
+    trap - EXIT
 }
-is_running(){
-    local pid; pid=$(cat "$PID_FILE" 2>/dev/null)
-    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
-}
-uptime_str(){
-    local ts; ts=$(st_get LOGIN_TS)
-    [ -z "$ts" ] || [ "$ts" = "0" ] && return
-    local now d; now=$(date +%s); d=$(( now - ts ))
-    printf "%02d:%02d:%02d" "$(( d/3600 ))" "$(( (d%3600)/60 ))" "$(( d%60 ))"
-}
-uci_get(){ uci -q get "portal_login.main.$1" 2>/dev/null; }
-
-list_methods(){
-    printf '{\n'
-    printf '  "get_status": {},\n'
-    printf '  "get_logs":   { "lines": 0 },\n'
-    printf '  "get_config": {},\n'
-    printf '  "set_config": {\n'
-    printf '    "user":"","pass":"","key":"","probe_url":"",\n'
-    printf '    "check_interval":0,"retry_interval":0,\n'
-    printf '    "relogin_hour":0,"log_max":0,"debug":0,"enabled":0\n'
-    printf '  },\n'
-    printf '  "do_action": { "action": "" }\n'
-    printf '}\n'
-}
-
-method_get_status(){
-    if is_running; then
-        local running; running="true"
-    else
-        local running; running="false"
-        st_set STATE "STOPPED" 2>/dev/null
-    fi
-    printf '{\n'
-    printf '  "state":      %s,\n' "$(js "$(st_get STATE)")"
-    printf '  "running":    %s,\n' "$running"
-    printf '  "p_host":     %s,\n' "$(js "$(st_get P_HOST)")"
-    printf '  "p_bras":     %s,\n' "$(js "$(st_get P_BRAS)")"
-    printf '  "p_clientip": %s,\n' "$(js "$(st_get P_CLIENTIP)")"
-    printf '  "p_vlan":     %s,\n' "$(js "$(st_get P_VLAN)")"
-    printf '  "last_login": %s,\n' "$(js "$(st_get LAST_LOGIN)")"
-    printf '  "last_check": %s,\n' "$(js "$(st_get LAST_CHECK)")"
-    printf '  "login_ts":   %s,\n' "$(st_get LOGIN_TS 2>/dev/null || echo 0)"
-    printf '  "uptime":     %s,\n' "$(js "$(uptime_str)")"
-    printf '  "fail_count": %s,\n' "$(st_get FAIL_COUNT 2>/dev/null || echo 0)"
-    printf '  "error":      %s\n'  "$(js "$(st_get ERROR)")"
-    printf '}\n'
-}
-
-method_get_logs(){
-    local input; input=$(cat /dev/stdin)
-    local n; n=$(echo "$input" | jsonfilter -e '@.lines' 2>/dev/null)
-    [ -z "$n" ] || [ "$n" -le 0 ] && n=100
-    [ "$n" -gt 5000 ] && n=5000
-    local raw; raw=""
-    if [ -f "$LOG_FILE" ]; then
-        raw=$(tail -n "$n" "$LOG_FILE" \
-            | sed 's/\\/\\\\/g; s/"/\\"/g' \
-            | awk '{printf "%s\\n",$0}')
-    fi
-    printf '{"lines":"%s"}\n' "$raw"
-}
-
-method_get_config(){
-    local has_pass; has_pass="false"
-    [ -n "$(uci_get pass)" ] && has_pass="true"
-    printf '{\n'
-    printf '  "user":           %s,\n' "$(js "$(uci_get user)")"
-    printf '  "has_pass":       %s,\n' "$has_pass"
-    printf '  "key":            %s,\n' "$(js "$(uci_get key)")"
-    printf '  "probe_url":      %s,\n' "$(js "$(uci_get probe_url)")"
-    printf '  "check_interval": %s,\n' "$(js "$(uci_get check_interval)")"
-    printf '  "retry_interval": %s,\n' "$(js "$(uci_get retry_interval)")"
-    printf '  "relogin_hour":   %s,\n' "$(js "$(uci_get relogin_hour)")"
-    printf '  "log_max":        %s,\n' "$(js "$(uci_get log_max)")"
-    printf '  "debug":          %s,\n' "$(js "$(uci_get debug)")"
-    printf '  "enabled":        %s\n'  "$(js "$(uci_get enabled)")"
-    printf '}\n'
-}
-
-method_set_config(){
-    # 从 stdin 读取 JSON，写入临时文件供 jsonfilter 多次读取
-    local jf; jf="/tmp/.pl_cfg_$$"
-    cat /dev/stdin > "$jf"
-
-    local v
-
-    # 每个字段单独调用 jsonfilter，避免嵌套函数在 busybox ash 中的兼容问题
-    uci -q set portal_login.main=portal-login 2>/dev/null
-
-    v=$(jsonfilter -i "$jf" -e '@.user' 2>/dev/null)
-    [ -n "$v" ] && uci -q set portal_login.main.user="$v"
-
-    # 密码明文存储，与其他配置项相同处理
-    v=$(jsonfilter -i "$jf" -e '@.pass' 2>/dev/null)
-    [ -n "$v" ] && uci -q set portal_login.main.pass="$v"
-
-    v=$(jsonfilter -i "$jf" -e '@.key' 2>/dev/null)
-    [ -n "$v" ] && [ "${#v}" -eq 16 ] && uci -q set portal_login.main.key="$v"
-
-    v=$(jsonfilter -i "$jf" -e '@.probe_url' 2>/dev/null)
-    [ -n "$v" ] && uci -q set portal_login.main.probe_url="$v"
-
-    v=$(jsonfilter -i "$jf" -e '@.check_interval' 2>/dev/null)
-    [ -n "$v" ] && uci -q set portal_login.main.check_interval="$v"
-
-    v=$(jsonfilter -i "$jf" -e '@.retry_interval' 2>/dev/null)
-    [ -n "$v" ] && uci -q set portal_login.main.retry_interval="$v"
-
-    v=$(jsonfilter -i "$jf" -e '@.relogin_hour' 2>/dev/null)
-    [ -n "$v" ] && uci -q set portal_login.main.relogin_hour="$v"
-
-    v=$(jsonfilter -i "$jf" -e '@.log_max' 2>/dev/null)
-    [ -n "$v" ] && [ "$v" -ge 50 ] 2>/dev/null && uci -q set portal_login.main.log_max="$v"
-
-    v=$(jsonfilter -i "$jf" -e '@.debug' 2>/dev/null)
-    [ -n "$v" ] && uci -q set portal_login.main.debug="$v"
-
-    v=$(jsonfilter -i "$jf" -e '@.enabled' 2>/dev/null)
-    [ -n "$v" ] && uci -q set portal_login.main.enabled="$v"
-
-    rm -f "$jf"
-    uci -q commit portal_login 2>/dev/null
-
-    printf '{"result":"ok","msg":"配置已保存"}\n'
-}
-
-method_do_action(){
-    local jf; jf="/tmp/.pl_act_$$"
-    cat /dev/stdin > "$jf"
-    local action; action=$(jsonfilter -i "$jf" -e '@.action' 2>/dev/null)
-    rm -f "$jf"
-
-    local msg; msg="ok"
-    local result; result="ok"
+method_do_action() {
+    local input action rc=0 msg
+    input=$(cat)
+    json_load "$input" 2>/dev/null || { reply error "请求不是有效 JSON"; return; }
+    json_get_var action action
     case "$action" in
-        start)
-            /etc/init.d/portal-login start >/dev/null 2>&1
-            msg="启动中" ;;
-        stop)
-            /etc/init.d/portal-login stop >/dev/null 2>&1
-            st_set STATE "STOPPED" 2>/dev/null
-            msg="已停止" ;;
-        restart)
-            /etc/init.d/portal-login restart >/dev/null 2>&1
-            msg="重启中" ;;
-        login)
-            $PROG login >/dev/null 2>&1 &
-            msg="登录中" ;;
-        relogin)
-            $PROG relogin >/dev/null 2>&1 &
-            msg="重新登录中" ;;
-        probe)
-            $PROG probe >/dev/null 2>&1 &
-            msg="探测中" ;;
-        logs_clear)
-            true > "$LOG_FILE"
-            msg="日志已清空" ;;
-        *)
-            msg="未知操作: $action"
-            result="error" ;;
+        start|stop|restart)
+            "$INIT_SCRIPT" "$action" >/dev/null 2>&1 || rc=$?
+            msg="服务操作已提交" ;;
+        login|relogin|probe)
+            "$PROG" "$action" >/dev/null 2>&1 &
+            msg="操作已提交，请查看状态和日志" ;;
+        logs_clear) : > "$LOG_FILE"; msg="日志已清空" ;;
+        *) reply error "未知操作"; return ;;
     esac
-    printf '{"result":"%s","msg":"%s"}\n' "$result" "$msg"
+    [ "$rc" = 0 ] && reply ok "$msg" || reply error "服务操作失败"
 }
-
 case "$1" in
     list) list_methods ;;
     call)
         case "$2" in
-            get_status)  method_get_status  ;;
-            get_logs)    method_get_logs    ;;
-            get_config)  method_get_config  ;;
-            set_config)  method_set_config  ;;
-            do_action)   method_do_action   ;;
-            *) printf '{"error":"unknown method"}\n' ;;
+            get_status) method_get_status ;;
+            get_logs) method_get_logs ;;
+            get_config) method_get_config ;;
+            set_config) method_set_config ;;
+            do_action) method_do_action ;;
+            *) reply error "未知方法" ;;
         esac ;;
-    *) printf '{"error":"usage error"}\n' ;;
+    *) reply error "调用方式无效" ;;
 esac

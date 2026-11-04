@@ -19,13 +19,16 @@ start_service() {
     procd_set_param stdout 1
     procd_set_param stderr 1
     procd_set_param pidfile /var/run/portal-login.pid
-    # UCI 配置变更时自动 reload
-    procd_add_reload_trigger "portal_login"
     procd_close_instance
 }
 
+service_triggers() {
+    procd_add_reload_trigger "portal_login"
+}
+
 stop_service() {
-    rm -f /var/lock/portal-login.lock
+    # flock 由内核在进程退出时释放，不删除仍可能被手动操作使用的锁文件。
+    :
 }
 
 reload_service() {
