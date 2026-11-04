@@ -32,4 +32,10 @@ OpenClash 为自己发出的网络请求保留了绕过代理的机制。Portal 
 
 新版不再读取旧的 `direct_tos` 选项，也不依赖此前为探针添加的 DSCP 规则和独立 DNS 名单。
 
-升级不会自动删除你已有的 OpenClash 设置，避免误删兼用于其他业务的规则。如果以前按旧方案手工配置过探针例外，可以在确认新版运行正常后检查并移除仅服务于 Portal Loginer 的项目；订阅更新等其他用途的配置应保留。
+升级不会自动删除你已有的 OpenClash 设置，避免误删兼用于其他业务的规则。只有以前照旧方案添加过配置的用户，才需要检查这些旧项目：
+
+- 来源流量访问控制中，备注为 `PortalLogin_Direct_42` 的旧规则。
+- `portal_login.main.direct_tos` 旧参数；新版已忽略它，删除不会影响功能。
+- 仅为探针添加的第二 DNS、DNS 策略、Fake-IP 过滤和 DIRECT 例外。三个默认探针域名是 `connect.rom.miui.com`、`connectivitycheck.platform.hicloud.com`、`wifi.vivo.com.cn`。旧配置可能分散在覆写模块和自定义列表里，需要一起检查。
+
+确认新版正常后，可以移除这些仅服务于 Portal Loginer 的项目，并应用 OpenClash 配置。订阅、GitHub 更新或其他设备仍在使用的 DNS 与直连配置应保留，不能把整个模块或 DNS 列表一并删除。
