@@ -1,6 +1,6 @@
-# Portal Loginer 1.4 技术说明
+# Portal Loginer 开发者说明
 
-本文对应 1.4.0 代码。验证记录与边界见 [REVIEW.md](REVIEW.md)，旧实现以 Git 历史为准。
+本文对应 1.4.0 代码，供开发和维护使用。内部审查见 [开发记录](docs/development/REVIEW.md)，旧实现以 Git 历史为准。
 
 ## 1. 文件与职责
 
@@ -154,7 +154,7 @@ JSON 使用系统 jshn 解析/序列化；缺失或畸形数字不会生成无�
 - package.sh：umask077 下构建、共享目录、配置权限、conffiles、脚本模式和语法。
 
 本地 Node 仅用于 Windows 离线测试的 JSON 解析替身，不进入安装包。设备端使用真实系统 JSON 工具。
-模拟通过不代替真实认证、冷启动、LAN 透明转发和游戏场景验收。每次现场验证记录版本、环境、操作、观察结果与限制，见 REVIEW.md。
+模拟通过不代替真实认证、冷启动、LAN 透明转发和游戏场景验收。每次现场验证记录版本、环境、操作、观察结果与限制，见 docs/development/REVIEW.md。
 
 ## 9. 开机校时与耗时
 
