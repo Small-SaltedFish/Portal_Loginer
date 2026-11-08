@@ -4,6 +4,8 @@
 
 插件适用于本项目使用的校园认证系统，并不支持所有学校。更换学校前，需要先确认认证方式是否兼容。
 
+插件基于沈阳建筑大学的移动校园宽带认证系统开发。
+
 ## 安装
 
 1. 从 [Releases](https://github.com/Small-SaltedFish/Portal_Loginer/releases) 下载 `.ipk` 安装包。
